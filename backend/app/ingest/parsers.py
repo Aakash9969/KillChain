@@ -293,6 +293,12 @@ SUSPICIOUS_HINTS = re.compile(
 
 
 def parse_jsonl_line(line: str, now: datetime) -> dict[str, Any] | None:
+    # FortiGate firewall key=value logs (large firex datasets) - check raw line first
+    if "eventtime=" in line[:2000] or ("devname=" in line[:2000] and "srcip=" in line[:2000]):
+        try:
+            return parse_fortigate_line(line, now)
+        except Exception:
+            return None
     try:
         rec = json.loads(line)
     except json.JSONDecodeError:
@@ -345,10 +351,132 @@ def parse_jsonl_line(line: str, now: datetime) -> dict[str, Any] | None:
                username=_norm_user(str(user)) if user else None,
                src_ip=str(_pick(rec, "src_ip")) if _pick(rec, "src_ip") else None,
                dst_ip=str(_pick(rec, "dst_ip")) if _pick(rec, "dst_ip") else None,
+               dst_port=_int_or_none(_pick(rec, "port")),
                host=str(host) if host else None,
                process=str(process) if process else None,
                action=raw_type or None,
                message=message, details=details, ts=ts, ts_text=ts_text)
+
+
+def _int_or_none(v) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
+# FortiGate firewall logs (key=value pairs) - used by the large firex datasets
+# ---------------------------------------------------------------------------
+FG_KEY_RE = re.compile(r'(\w+)=(?:"([^"]*)"|(\S+))')
+
+# FortiGate type/subtype -> canonical mapping
+FG_LEVEL_SEV = {"information": "info", "notice": "low", "warning": "medium",
+                "alert": "high", "error": "high", "critical": "critical",
+                "emergency": "critical", "debug": "info"}
+
+
+def parse_fortigate_line(line: str, now: datetime) -> dict[str, Any] | None:
+    if "devname=" not in line and "devid=" not in line:
+        return None
+    fields = {}
+    for m in FG_KEY_RE.finditer(line):
+        k = m.group(1)
+        if k not in fields:
+            fields[k] = m.group(2) if m.group(2) is not None else m.group(3)
+
+    # timestamp: eventtime is epoch nanoseconds (authoritative); fall back to date/time
+    ts, ts_text = None, None
+    et = fields.get("eventtime")
+    if et:
+        try:
+            ts = int(et) / 1e9
+            ts_text = f'{fields.get("date", "")} {fields.get("time", "")}'.strip() or None
+        except (ValueError, OverflowError):
+            ts = None
+    if ts is None and fields.get("date") and fields.get("time"):
+        try:
+            dt = datetime.fromisoformat(f'{fields["date"]}T{fields["time"]}')
+            ts, ts_text = dt.timestamp(), f'{fields["date"]} {fields["time"]}'
+        except ValueError:
+            pass
+
+    ftype = fields.get("type", "")
+    subtype = fields.get("subtype", "")
+    level = fields.get("level", "information")
+    sev = FG_LEVEL_SEV.get(level, "info")
+    user = _norm_user(fields.get("user"))
+    src, dst = fields.get("srcip"), fields.get("dstip")
+    dstport = _int_or_none(fields.get("dstport"))
+    devname = fields.get("devname") or fields.get("devid") or "fortigate"
+    action = fields.get("action", "")
+    status = (fields.get("status") or "").lower()
+    msg = fields.get("msg") or fields.get("logdesc") or ""
+
+    event_type, outcome, ev_action, severity = "other", "unknown", None, sev
+    if ftype == "event" and subtype == "system" and action == "login":
+        event_type = "auth_failure" if status == "failed" else "auth_success"
+        outcome = status if status in ("success", "failure") else "unknown"
+        ev_action = "admin_login"
+        # admin-interface authentication failures are worth more than a typo
+        severity = "medium" if event_type == "auth_failure" else "info"
+    elif ftype == "event" and subtype == "vpn" and action in ("ssl-login", "tunnel-up"):
+        event_type = "auth_failure" if status == "failed" else "auth_success"
+        outcome = status if status in ("success", "failure") else "unknown"
+        ev_action = "vpn_login"
+        severity = "medium" if event_type == "auth_failure" else "info"
+    elif ftype == "traffic" or subtype == "forward":
+        event_type, ev_action = "network", "forward"
+        outcome = "success" if action == "accept" else "failure" if action in ("deny", "blocked", "dropped") else "unknown"
+    elif subtype == "dns":
+        event_type, ev_action, outcome = "network", "dns", "success"
+    elif subtype == "webfilter":
+        event_type, ev_action = "network", "webfilter"
+        outcome = "failure" if action in ("blocked", "block") else "success"
+        severity = "high" if outcome == "failure" else sev
+    elif subtype == "ips":
+        event_type, ev_action = "network", "ips"
+        outcome = "failure" if action in ("blocked", "dropped", "reset") else "success"
+        severity = "high" if outcome == "failure" else sev
+    elif subtype == "virus":
+        event_type, ev_action = "network", "virus"
+        outcome = "failure" if action in ("blocked", "dropped") else "success"
+        severity = "high" if outcome == "failure" else sev
+    elif subtype == "app":
+        event_type, ev_action, outcome = "network", "app_control", "success"
+    elif ftype == "event":
+        outcome = status if status in ("success", "failure") else "unknown"
+
+    if user:
+        username = user
+    else:
+        username = None
+
+    details = {k: v for k, v in fields.items() if k not in _FG_DROP_KEYS and v}
+    if dstport is not None:
+        details["dst_port"] = dstport
+    if fields.get("service"):
+        details["service"] = fields["service"]
+    if fields.get("hostname"):
+        details["dns_query"] = fields["hostname"]
+    if fields.get("url"):
+        details["url"] = fields["url"]
+    if fields.get("catdesc"):
+        details["category"] = fields["catdesc"]
+    if fields.get("app"):
+        details["app"] = fields["app"]
+
+    return _ev(
+        event_type=event_type, severity=severity, outcome=outcome,
+        username=username, src_ip=src, dst_ip=dst, dst_port=dstport,
+        host=devname, process=None, action=ev_action,
+        message=msg or f"{ftype}/{subtype or '-'} {action or ''}".strip(),
+        bytes_out=_int_or_none(fields.get("sentbyte")) or 0,
+        bytes_in=_int_or_none(fields.get("rcvdbyte")) or 0,
+        details=details, ts=ts, ts_text=ts_text)
+
+
+_FG_DROP_KEYS = {"msg", "logdesc", "date", "time", "eventtime", "tz", "raw"}
 
 
 def detect_format(line: str) -> str:
@@ -361,4 +489,6 @@ def detect_format(line: str) -> str:
             pass
     if SYSLOG_RE.match(s):
         return "syslog"
+    if "devname=" in s and "eventtime=" in s or ("type=" in s and "subtype=" in s and "srcip=" in s):
+        return "fortigate"
     return "unknown"

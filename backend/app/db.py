@@ -61,11 +61,14 @@ CREATE TABLE IF NOT EXISTS events (
   username TEXT,
   src_ip TEXT,
   dst_ip TEXT,
+  dst_port INTEGER,
   host TEXT,
   process TEXT,
   action TEXT,                      -- free-form normalized action e.g. ssh_login, sudo, powershell
   outcome TEXT,                     -- success|failure|unknown
   message TEXT,
+  bytes_out INTEGER,                -- bytes sent (firewall/ECS telemetry, 0 if n/a)
+  bytes_in INTEGER,                 -- bytes received
   details TEXT,                     -- JSON dict of extra fields
   raw TEXT NOT NULL                 -- ORIGINAL raw log line (evidence)
 );
@@ -74,20 +77,50 @@ CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_events_user ON events(username);
 CREATE INDEX IF NOT EXISTS idx_events_src_ip ON events(src_ip);
 CREATE INDEX IF NOT EXISTS idx_events_host ON events(host);
+CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
 
 CREATE TABLE IF NOT EXISTS ingest_jobs (
   id TEXT PRIMARY KEY,
   source_id INTEGER,
   filename TEXT,
   origin TEXT,
-  status TEXT NOT NULL,             -- running|done|error
+  status TEXT NOT NULL,             -- running|done|error|interrupted
   processed_lines INTEGER DEFAULT 0,
   parsed_events INTEGER DEFAULT 0,
   parse_errors INTEGER DEFAULT 0,
   error_text TEXT,
   started_at REAL,
-  finished_at REAL
+  finished_at REAL,
+  -- folder / large-dataset ingestion
+  source_dir TEXT,
+  files_total INTEGER DEFAULT 0,
+  files_done INTEGER DEFAULT 0,
+  current_file TEXT,
+  total_bytes INTEGER DEFAULT 0,
+  bytes_done INTEGER DEFAULT 0,
+  records_read INTEGER DEFAULT 0,
+  speed_eps REAL DEFAULT 0,         -- parsed events per second
+  eta_seconds REAL,                 -- estimated remaining time
+  resumable INTEGER DEFAULT 0
 );
+
+-- per-file checkpoint state for resumable folder ingestion
+CREATE TABLE IF NOT EXISTS ingest_files (
+  id INTEGER PRIMARY KEY,
+  job_id TEXT NOT NULL REFERENCES ingest_jobs(id) ON DELETE CASCADE,
+  path TEXT NOT NULL,
+  name TEXT NOT NULL,
+  format TEXT NOT NULL,
+  byte_size INTEGER DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending',   -- pending|running|done|error
+  byte_offset INTEGER DEFAULT 0,            -- offset after last committed complete line
+  line_no INTEGER DEFAULT 0,
+  parsed_events INTEGER DEFAULT 0,
+  parse_errors INTEGER DEFAULT 0,
+  source_id INTEGER,
+  error_text TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_ingest_files_job ON ingest_files(job_id);
 
 CREATE TABLE IF NOT EXISTS analyses (
   id INTEGER PRIMARY KEY,
@@ -141,7 +174,38 @@ CREATE INDEX IF NOT EXISTS idx_incidents_analysis ON incidents(analysis_id);
 def init_db() -> None:
     conn = get_db()
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.commit()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Lightweight column migrations for databases created by older versions."""
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(events)")}
+    for col, ddl in [
+        ("dst_port", "ALTER TABLE events ADD COLUMN dst_port INTEGER"),
+        ("bytes_out", "ALTER TABLE events ADD COLUMN bytes_out INTEGER"),
+        ("bytes_in", "ALTER TABLE events ADD COLUMN bytes_in INTEGER"),
+    ]:
+        if col not in cols:
+            conn.execute(ddl)
+    if "idx_events_type" not in {r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='events'")}:
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type)")
+    jcols = {r["name"] for r in conn.execute("PRAGMA table_info(ingest_jobs)")}
+    for col, ddl in [
+        ("source_dir", "ALTER TABLE ingest_jobs ADD COLUMN source_dir TEXT"),
+        ("files_total", "ALTER TABLE ingest_jobs ADD COLUMN files_total INTEGER DEFAULT 0"),
+        ("files_done", "ALTER TABLE ingest_jobs ADD COLUMN files_done INTEGER DEFAULT 0"),
+        ("current_file", "ALTER TABLE ingest_jobs ADD COLUMN current_file TEXT"),
+        ("total_bytes", "ALTER TABLE ingest_jobs ADD COLUMN total_bytes INTEGER DEFAULT 0"),
+        ("bytes_done", "ALTER TABLE ingest_jobs ADD COLUMN bytes_done INTEGER DEFAULT 0"),
+        ("records_read", "ALTER TABLE ingest_jobs ADD COLUMN records_read INTEGER DEFAULT 0"),
+        ("speed_eps", "ALTER TABLE ingest_jobs ADD COLUMN speed_eps REAL DEFAULT 0"),
+        ("eta_seconds", "ALTER TABLE ingest_jobs ADD COLUMN eta_seconds REAL"),
+        ("resumable", "ALTER TABLE ingest_jobs ADD COLUMN resumable INTEGER DEFAULT 0"),
+    ]:
+        if col not in jcols:
+            conn.execute(ddl)
 
 
 def rows_to_dicts(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:

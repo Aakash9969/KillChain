@@ -1,15 +1,46 @@
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
 .venv/
+venv/
 
-# KillChain runtime data (databases, uploads, generated demo logs)
+# Environment variables and secrets
+.env
+.env.*
+!.env.example
+
+# KillChain runtime data
 data/
+logs/
+uploads/
+generated_logs/
+
+# Large datasets
+datasets/
+organizer_data/
+*.jsonl
+*.ndjson
+*.evtx
+*.syslog
+
+# Log files
+*.log
+*.logs
+
+# Databases
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary files
+*.tmp
+*.bak
+
+# Reports and previews
+scripts/report_preview.md
 
 # OS / editor
 .DS_Store
 Thumbs.db
-*.log
-!backend/app/**/*.py
-
-scripts/report_preview.md
+.vscode/
+.idea/

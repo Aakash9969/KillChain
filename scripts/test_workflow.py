@@ -4,7 +4,7 @@ import time
 import urllib.error
 import urllib.request
 
-BASE = "http://127.0.0.1:8000/api"
+BASE = "http://127.0.0.1:8765/api"
 
 
 def req(path, method="GET", data=None, ctype="application/json"):
