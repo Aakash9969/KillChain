@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# KillChain runtime data (databases, uploads, generated demo logs)
+data/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.log
+!backend/app/**/*.py

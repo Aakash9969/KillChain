@@ -1,0 +1,340 @@
+"""REST API for KillChain."""
+from __future__ import annotations
+
+import shutil
+import sqlite3
+import uuid
+from pathlib import Path
+
+from fastapi import APIRouter, File, HTTPException, UploadFile
+from pydantic import BaseModel
+
+from .. import config, db
+from ..ai import assistant
+from ..analysis import engine
+from ..analysis import detectors as det_mod
+from ..analysis.graph import build_graph
+from ..ingest import demo, pipeline
+from ..reports import build_report
+
+router = APIRouter(prefix="/api")
+
+
+# ---------------------------------------------------------------------------
+# Status & dashboard stats
+# ---------------------------------------------------------------------------
+@router.get("/status")
+def status():
+    conn = db.get_db()
+    n_events = conn.execute("SELECT COUNT(*) c FROM events").fetchone()["c"]
+    return {"ok": True, "events": n_events, "ai": assistant.ai_status(),
+            "data_dir": str(config.DATA_DIR)}
+
+
+@router.get("/stats")
+def stats():
+    conn = db.get_db()
+    total = conn.execute("SELECT COUNT(*) c FROM events").fetchone()["c"]
+    sev_dist = {r["severity"]: r["c"] for r in conn.execute(
+        "SELECT severity, COUNT(*) c FROM events GROUP BY severity")}
+
+    an_id = engine.latest_analysis_id(conn)
+    analysis = None
+    detections = []
+    suspicious_event_ids: set[int] = set()
+    incidents = []
+    if an_id:
+        arow = conn.execute("SELECT * FROM analyses WHERE id=?", (an_id,)).fetchone()
+        analysis = {k: arow[k] for k in ("id", "started_at", "finished_at", "events_analyzed",
+                                         "detections", "incidents", "status")}
+        detections = [dict(r) for r in conn.execute(
+            "SELECT * FROM detections WHERE analysis_id=?", (an_id,))]
+        for d in detections:
+            suspicious_event_ids.update(db.jload(d["event_ids"], []))
+        incidents = [_incident_row(r) for r in conn.execute(
+            "SELECT * FROM incidents WHERE analysis_id=? ORDER BY risk_score DESC", (an_id,))]
+
+    crit_high = sum(1 for d in detections if d["severity"] in ("critical", "high"))
+    sources = [_source_row(r) for r in conn.execute(
+        "SELECT * FROM sources ORDER BY uploaded_at DESC LIMIT 20")]
+    jobs = [dict(r) for r in conn.execute(
+        "SELECT * FROM ingest_jobs ORDER BY started_at DESC LIMIT 12")]
+
+    return {
+        "totals": {
+            "events": total,
+            "suspicious_events": len(suspicious_event_ids),
+            "incidents": len(incidents),
+            "detections": len(detections),
+            "critical_high_findings": crit_high,
+            "sources": len(sources),
+        },
+        "severity_distribution": sev_dist,
+        "recent_incidents": incidents[:5],
+        "recent_detections": [_det_row(d) for d in detections[:8]],
+        "sources": sources,
+        "ingest_jobs": jobs,
+        "last_analysis": analysis,
+        "ai": assistant.ai_status(),
+        "is_demo_data": bool(incidents and all(i.get("is_demo") for i in incidents)),
+    }
+
+
+def _source_row(r) -> dict:
+    s = dict(r)
+    s["uploaded_at"] = r["uploaded_at"]
+    return s
+
+
+def _det_row(d) -> dict:
+    d = dict(d)
+    d["mitre"] = db.jload(d["mitre"], [])
+    d["event_ids"] = db.jload(d["event_ids"], [])
+    d["entities"] = db.jload(d["entities"], {})
+    return d
+
+
+def _incident_row(r) -> dict:
+    return {
+        "id": r["id"], "ref": r["ref"], "name": r["name"], "summary": r["summary"],
+        "risk_score": r["risk_score"], "severity": r["severity"], "status": r["status"],
+        "first_ts": r["first_ts"], "last_ts": r["last_ts"], "is_demo": bool(r["is_demo"]),
+        "entities": db.jload(r["entities"], {}),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Ingestion
+# ---------------------------------------------------------------------------
+class DemoIngestBody(BaseModel):
+    pass  # no options needed; endpoint regenerates the synthetic files
+
+
+@router.post("/ingest/demo")
+def ingest_demo(body: DemoIngestBody | None = None):
+    files = demo.generate_demo_files()
+    job_ids = {}
+    for name, path in files.items():
+        fmt = "jsonl" if name.endswith(".jsonl") else "syslog"
+        job_ids[name] = pipeline.start_ingestion(path, name, fmt, origin="demo")
+    return {"jobs": job_ids, "note": "SYNTHETIC DEMONSTRATION DATA - generated locally, "
+                                     "not real intrusion logs."}
+
+
+@router.post("/ingest/upload")
+async def ingest_upload(file: UploadFile = File(...), fmt: str = "auto"):
+    updir = config.DATA_DIR / "uploads"
+    updir.mkdir(parents=True, exist_ok=True)
+    safe = Path(file.filename or "upload.log").name
+    dest = updir / f"{uuid.uuid4().hex[:8]}_{safe}"
+    with open(dest, "wb") as out:
+        shutil.copyfileobj(file.file, out)
+    job_id = pipeline.start_ingestion(dest, safe, fmt, origin="upload")
+    return {"job_id": job_id, "filename": safe}
+
+
+@router.get("/ingest/status/{job_id}")
+def ingest_status(job_id: str):
+    job = pipeline.JOBS.get(job_id)
+    if job is None:
+        conn = db.get_db()
+        row = conn.execute("SELECT * FROM ingest_jobs WHERE id=?", (job_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Unknown job")
+        job = dict(row)
+    return job
+
+
+@router.get("/sources")
+def sources():
+    conn = db.get_db()
+    return [_source_row(r) for r in conn.execute("SELECT * FROM sources ORDER BY uploaded_at DESC")]
+
+
+# ---------------------------------------------------------------------------
+# Events / log explorer
+# ---------------------------------------------------------------------------
+@router.get("/events")
+def list_events(source_id: int | None = None, severity: str | None = None,
+                event_type: str | None = None, q: str | None = None,
+                limit: int = 200, offset: int = 0):
+    conn = db.get_db()
+    where, args = ["1=1"], []
+    if source_id:
+        where.append("source_id=?"); args.append(source_id)
+    if severity:
+        where.append("severity=?"); args.append(severity)
+    if event_type:
+        where.append("event_type=?"); args.append(event_type)
+    if q:
+        where.append("(raw LIKE ? OR username LIKE ? OR host LIKE ? OR src_ip LIKE ? OR dst_ip LIKE ?)")
+        args.extend([f"%{q}%"] * 5)
+    wh = " AND ".join(where)
+    total = conn.execute(f"SELECT COUNT(*) c FROM events WHERE {wh}", args).fetchone()["c"]
+    rows = conn.execute(
+        f"SELECT id, source_id, line_no, ts, ts_text, event_type, severity, username, src_ip, "
+        f"dst_ip, host, process, action, outcome, message FROM events WHERE {wh} "
+        f"ORDER BY ts DESC, id DESC LIMIT ? OFFSET ?", (*args, min(limit, 1000), offset)).fetchall()
+    return {"total": total, "events": [dict(r) for r in rows]}
+
+
+@router.get("/events/{event_id}")
+def get_event(event_id: int):
+    conn = db.get_db()
+    row = conn.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Event not found")
+    e = dict(row)
+    e["details"] = db.jload(e.get("details"), {})
+    src = conn.execute("SELECT name, kind, origin FROM sources WHERE id=?",
+                       (e["source_id"],)).fetchone()
+    e["source"] = dict(src) if src else None
+    return e
+
+
+# ---------------------------------------------------------------------------
+# Analysis
+# ---------------------------------------------------------------------------
+@router.post("/analysis/run")
+def run_analysis():
+    # demo flag: sources with origin=demo => demo dataset
+    conn = db.get_db()
+    n = conn.execute("SELECT COUNT(*) c FROM sources WHERE origin='demo'").fetchone()["c"]
+    result = engine.run_analysis(is_demo=n > 0)
+    return result
+
+
+@router.get("/detections")
+def detections(analysis_id: int | None = None):
+    conn = db.get_db()
+    an_id = analysis_id or engine.latest_analysis_id(conn)
+    if not an_id:
+        return {"analysis_id": None, "detections": []}
+    rows = conn.execute("SELECT * FROM detections WHERE analysis_id=? "
+                        "ORDER BY first_ts", (an_id,)).fetchall()
+    return {"analysis_id": an_id, "detections": [_det_row(r) for r in rows]}
+
+
+@router.get("/incidents")
+def incidents():
+    conn = db.get_db()
+    an_id = engine.latest_analysis_id(conn)
+    if not an_id:
+        return {"analysis_id": None, "incidents": []}
+    rows = conn.execute("SELECT * FROM incidents WHERE analysis_id=? ORDER BY risk_score DESC",
+                        (an_id,)).fetchall()
+    return {"analysis_id": an_id, "incidents": [_incident_row(r) for r in rows]}
+
+
+@router.get("/incidents/{incident_id}")
+def incident_detail(incident_id: int):
+    conn = db.get_db()
+    inc = engine.get_incident(conn, incident_id)
+    if not inc:
+        raise HTTPException(404, "Incident not found")
+    events = engine.get_incident_events(conn, inc["event_ids"])
+    dets = engine.get_incident_detections(conn, inc["detection_ids"])
+    graph = build_graph(inc, events, dets)
+    det_view = [_det_row({**d, "analysis_id": inc["analysis_id"]}) for d in dets]
+    return {"incident": inc, "events": events, "detections": det_view, "graph": graph}
+
+
+@router.get("/incidents/{incident_id}/report")
+def incident_report(incident_id: int):
+    conn = db.get_db()
+    report = build_report(conn, incident_id)
+    if report is None:
+        raise HTTPException(404, "Incident not found")
+    return report
+
+
+# ---------------------------------------------------------------------------
+# Entity explorer
+# ---------------------------------------------------------------------------
+@router.get("/entities")
+def entities():
+    conn = db.get_db()
+    kinds = {"user": "username", "host": "host", "ip": None}
+    out = []
+    for kind, col in [("user", "username"), ("host", "host")]:
+        rows = conn.execute(
+            f"SELECT {col} ident, COUNT(*) cnt, MAX(ts) last_ts FROM events "
+            f"WHERE {col} IS NOT NULL AND {col} != '' GROUP BY {col}").fetchall()
+        out.extend({"kind": kind, "ident": r["ident"], "event_count": r["cnt"],
+                    "last_ts": r["last_ts"]} for r in rows)
+    seen: dict[str, dict] = {}
+    for r in conn.execute(
+            "SELECT ip, cnt, last_ts FROM (SELECT src_ip ip, COUNT(*) cnt, MAX(ts) last_ts "
+            "FROM events WHERE src_ip IS NOT NULL GROUP BY src_ip "
+            "UNION ALL SELECT dst_ip ip, COUNT(*) cnt, MAX(ts) last_ts FROM events "
+            "WHERE dst_ip IS NOT NULL GROUP BY dst_ip)"):
+        if r["ip"] in seen:
+            seen[r["ip"]]["event_count"] += r["cnt"]
+            seen[r["ip"]]["last_ts"] = max(seen[r["ip"]]["last_ts"] or 0, r["last_ts"] or 0)
+        else:
+            seen[r["ip"]] = {"kind": "ip", "ident": r["ip"], "event_count": r["cnt"],
+                             "last_ts": r["last_ts"]}
+    out.extend(seen.values())
+    # annotate external ips
+    for e in out:
+        if e["kind"] == "ip":
+            e["external"] = det_mod.is_external(e["ident"])
+        e["last_seen"] = e.pop("last_ts")
+    out.sort(key=lambda x: -(x["event_count"]))
+    return out
+
+
+@router.get("/entities/{kind}/{ident:path}")
+def entity_detail(kind: str, ident: str):
+    conn = db.get_db()
+    if kind == "user":
+        col = "username"
+    elif kind == "host":
+        col = "host"
+    elif kind == "ip":
+        col = None
+    else:
+        raise HTTPException(400, "kind must be user, host or ip")
+    if col:
+        rows = conn.execute(
+            f"SELECT id, ts, ts_text, event_type, severity, username, src_ip, dst_ip, host, "
+            f"process, action, outcome, message FROM events WHERE {col}=? ORDER BY ts", (ident,)).fetchall()
+        where = f"{col}=?"
+        args = (ident,)
+    else:
+        rows = conn.execute(
+            "SELECT id, ts, ts_text, event_type, severity, username, src_ip, dst_ip, host, "
+            "process, action, outcome, message FROM events WHERE src_ip=? OR dst_ip=? ORDER BY ts",
+            (ident, ident)).fetchall()
+        where = "(src_ip=? OR dst_ip=?)"
+        args = (ident, ident)
+    # incidents containing this entity
+    incs = []
+    an_id = engine.latest_analysis_id(conn)
+    if an_id:
+        for r in conn.execute("SELECT * FROM incidents WHERE analysis_id=?", (an_id,)):
+            ents = db.jload(r["entities"], {})
+            pool = set()
+            for v in ents.values():
+                pool.update(v)
+            if ident in pool:
+                incs.append(_incident_row(r))
+    return {"kind": kind, "ident": ident, "external": det_mod.is_external(ident) if kind == "ip" else None,
+            "events": [dict(r) for r in rows], "incidents": incs}
+
+
+# ---------------------------------------------------------------------------
+# AI assistant
+# ---------------------------------------------------------------------------
+class AskBody(BaseModel):
+    question: str
+
+
+@router.get("/ai/status")
+def ai_status():
+    return assistant.ai_status()
+
+
+@router.post("/incidents/{incident_id}/ai")
+async def incident_ai(incident_id: int, body: AskBody):
+    return await assistant.ask(incident_id, body.question)
