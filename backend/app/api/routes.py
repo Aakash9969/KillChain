@@ -365,3 +365,17 @@ def ai_status():
 @router.post("/incidents/{incident_id}/ai")
 async def incident_ai(incident_id: int, body: AskBody):
     return await assistant.ask(incident_id, body.question)
+
+
+# ---------------------------------------------------------------------------
+# Admin (demo convenience)
+# ---------------------------------------------------------------------------
+@router.post("/admin/reset")
+def admin_reset():
+    """Wipe all data for a clean demonstration run."""
+    conn = db.get_db()
+    for table in ("incidents", "detections", "analyses", "events", "ingest_jobs", "sources"):
+        conn.execute(f"DELETE FROM {table}")
+    conn.execute("DELETE FROM sqlite_sequence")
+    conn.commit()
+    return {"ok": True}

@@ -84,7 +84,7 @@ PRESET_QUESTIONS = [
 ]
 
 
-def ask(incident_id: int, question: str) -> dict:
+async def ask(incident_id: int, question: str) -> dict:
     if not config.ai_available():
         raise HTTPException(
             503,
