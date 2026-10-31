@@ -1,13 +1,16 @@
 # KillChain — Cybersecurity Attack Reconstruction Platform
 
-KillChain ingests raw security logs, detects suspicious behavior with **deterministic,
-explainable rules**, correlates scattered events into **reconstructed attack incidents**,
-maps them to **MITRE ATT&CK** and the **Cyber Kill Chain**, and renders everything as an
-interactive attack graph, timeline, AI-assisted investigation and exportable report.
+KillChain ingests raw security logs (EDR telemetry, firewall exports, syslog), detects
+suspicious behavior with **deterministic, explainable rules**, correlates scattered events
+into **reconstructed attack incidents**, and presents each investigation as an
+**Attack Storyboard** — a chronological, evidence-backed narrative synchronized with an
+interactive attack graph — plus MITRE ATT&CK mapping, look-ahead analysis of potential
+next targets, and exportable incident reports.
 
-> ⚠️ All demonstration datasets shipped with the project are **SYNTHETIC DEMONSTRATION
-> DATA** generated locally. Findings produced from them are labelled as such in the UI
-> and in reports, and never claimed to come from a real intrusion.
+> ⚠️ Demo datasets shipped with the project are **SYNTHETIC DEMONSTRATION DATA**
+> generated locally. Findings derived from them are labelled as such in the UI and in
+> reports and are never presented as a real intrusion. Datasets you ingest yourself
+> (uploads / local folders) are treated as real data and are *not* labelled as demo.
 
 ---
 
@@ -22,97 +25,170 @@ python -m venv .venv
 
 Then open **http://127.0.0.1:8765** (or run `start.bat`).
 
-> Port note: 8765 is used because port 8000 is commonly occupied by other local
-> dev tools. KillChain serves its own frontend, so any port works — e.g.
-> `--port 9000`.
+> Port 8765 is used because 8000 is commonly occupied by other local tools. KillChain
+> serves its own frontend, so any port works.
 
-### Demo workflow (Checkpoint 1)
+## Demo workflow
 
-1. Open the dashboard (Overview).
-2. Click **Load demonstration dataset** — generates + streams three synthetic log files
-   (`auth_gateway.log`, `edr_endpoints.jsonl`, `db_server.log`) and runs the analysis.
-   - Alternatively: **Generate EDR telemetry (ECS)** runs the hackathon-provided
-     `edr_log_generator.py` and ingests 900 ECS-format events.
-   - Or import your own log file in the **Log Explorer** (syslog / JSON / ECS JSONL,
-     auto-detected, streaming ingestion with live progress).
-3. View detections in Overview / Log Explorer; click any event for its raw evidence.
-4. Open **Investigations** → the reconstructed incident (risk score, kill-chain strip).
-5. Explore the **interactive attack graph** (drag, zoom, click nodes/edges; dashed =
-   inferred, solid = observed evidence).
-6. Follow the chronological **timeline**, inspect **MITRE ATT&CK** mappings and open the
-   evidence behind every detection.
-7. Ask the **AI investigator** (see below) or open **Reports** for the full incident
-   report (download as Markdown, print to PDF).
+1. **Overview** → *Load demonstration dataset* — generates + streams three synthetic log
+   files and runs the analysis. Or *Generate EDR telemetry (ECS)* using the
+   hackathon-provided `edr_log_generator.py`.
+2. **Log Explorer** → view the event stream, search/filter, click any event for its raw
+   evidence; import your own files (multi-file drag & drop) or ingest a local folder.
+3. **Investigations** → open the reconstructed incident. The **Attack Storyboard** tells
+   the story chronologically in Kill-Chain phases; click any step to highlight it in the
+   graph and vice versa.
+4. Inspect **Potential next targets** (look-ahead), **MITRE ATT&CK** mappings,
+   **detections** with explanations and evidence IDs, **hypotheses**, and the AI
+   assistant (optional).
+5. **Reports** → full incident report (Markdown download / print).
 
-## AI Investigation Assistant (optional)
+## Supported log formats
 
-The assistant uses the GLM provider through environment variables only — nothing is
-hardcoded, and **everything else works without it**:
+| Format | Files | Notes |
+|---|---|---|
+| FortiGate key=value | `.log` | traffic, DNS, webfilter, IPS, virus, admin/VPN logins (the large `firex-*.log` datasets) |
+| syslog (OpenSSH/sshd/sudo/openvpn) | `.log`, `.txt` | line-based |
+| JSON / ECS JSONL | `.jsonl`, `.json`, `.ndjson` | flat JSON and ECS (hackathon EDR generator) |
+
+Format is auto-detected per file (peek at first line) and per line; malformed lines are
+counted as parse errors and never stop ingestion. **Binary/corrupted regions are skipped
+automatically** (the parser re-syncs on the next valid record) and reported per file.
+
+## Large datasets (tested at multi-GB scale)
+
+- **Local-folder ingestion**: enter an absolute directory path in the Log Explorer, scan,
+  select files (name/size/format shown), and ingest. Files are read **streaming in 4 MB
+  chunks** with 1000-event batches — memory stays flat regardless of file size.
+- **Resumable**: every file has a byte-offset checkpoint committed at line boundaries.
+  If the process dies, the job is marked `interrupted` on next start and can be resumed
+  from the checkpoint (no duplicate events). Compressed formats are not supported.
+- **Progress** comes from the backend: bytes processed/total, records, parsed, errors,
+  events/s, ETA, per-file status.
+- **Analysis at scale**: datasets above `KILLCHAIN_FULL_SCAN_LIMIT` (default 200,000
+  events) are analyzed with **SQL-first aggregations** (GROUP BY/HAVING over indexed
+  columns, including a partial covering index for network events) that materialize only
+  bounded evidence samples. Memory stays O(detections), not O(events).
+
+**Actually tested (this machine):** 6.54 GB FortiGate file (`firex-10G.log`, 4.9 GB of
+real logs + binary padding tail), 9,125,385 events ingested in ~26 min (~5,900 ev/s,
+zero parse errors on the real portion), analysis in streaming mode with **peak RSS
+< 0.1 GB** (51 MB observed during ingestion, 63 MB during analysis). The 30 GB target
+is architecturally supported by the same streaming path but has **not** been tested at
+full 30 GB scale on this machine.
+
+## The Attack Storyboard
+
+The storyboard groups an incident's evidence into Kill-Chain phases (only phases with
+evidence appear; unsupported stages are explicitly listed as gaps). Each step shows
+time, action narrative, source/target entities, user, host, IPs, process, MITRE
+techniques, detection, severity, confidence, and clickable evidence IDs. The storyboard
+and the attack graph are synchronized both ways (storyboard step → graph highlight;
+graph node → related storyboard steps).
+
+## Look-ahead (potential next targets)
+
+Deterministic analysis of what the attacker could reach next, strictly from observed
+evidence: probed-but-not-accessed hosts, accounts valid on other systems, reachable
+services. Every target is labelled **INFERRED**, cites evidence, and states why it is
+relevant. Missing information (privileges, topology) is stated explicitly. Potential
+targets are never presented as confirmed compromises. AI is never involved in this
+analysis.
+
+## AI assistant (optional, evidence-bound)
 
 ```
-GLM_API_KEY    your API key
-GLM_BASE_URL   OpenAI-compatible base URL (default: https://api.z.ai/api/paas/v4)
-GLM_MODEL      model name (default: glm-4.6)
+GLM_API_KEY     API key (enables the assistant)
+GLM_BASE_URL    OpenAI-compatible base URL (default https://api.z.ai/api/paas/v4)
+GLM_MODEL       model name (default glm-4.6)
 ```
 
-The assistant is strictly evidence-bound: the backend feeds it the incident's real
-detections/timeline/edges, and the system prompt forbids inventing evidence; answers
-cite event ids (clickable).
+The backend assembles the incident's real detections/storyboard/timeline/look-ahead as
+context; the system prompt forbids inventing evidence and requires event-ID citations.
+Without a key everything else works and the assistant shows a clear unavailable state.
+
+## Configuration & security
+
+- `KILLCHAIN_DATA_DIR` — data directory (default `./data`).
+- `KILLCHAIN_ALLOWED_DIRS` — semicolon-separated roots for local-folder ingestion
+  (default: project folder + `data/`). Paths outside are rejected (validated server-side;
+  no browser filesystem pretense, no traversal).
+- `KILLCHAIN_FULL_SCAN_LIMIT` — event count above which analysis switches to the
+  SQL-first streaming path.
+- Server binds to localhost by default. Original log files are never modified; log
+  contents are treated as untrusted data (parsed, never executed). Uploaded filenames
+  are sanitized. Raw evidence is preserved for every ingested event.
+
+## Detection rules (deterministic, evidence-citing)
+
+| Rule | Behavior | MITRE | Kill Chain |
+|---|---|---|---|
+| BRUTE_FORCE_AUTH | repeated failed logins (pair burst / per (user,ip)) | T1110.001 | Delivery |
+| AUTH_SPRAYING | one source failing against many accounts | T1110.003 | Delivery |
+| AUTH_TARGETED_BRUTE | one account attacked from many sources | T1110.001 | Delivery |
+| SUCCESS_AFTER_FAILURES | success after failure burst (same account+source) | T1078 | Exploitation |
+| SUSPICIOUS_AUTH_ODD_HOUR | night login from first-seen external source | T1078.001 | Exploitation |
+| SUSPICIOUS_PROCESS_EXEC | discovery/credential tooling in EDR telemetry | T1033/T1087/... | Installation |
+| LATERAL_MOVEMENT | internal pivoting, only with suspicious context | T1021.004 | Installation |
+| NETWORK_PROBE_INTERNAL | internal reachability scans | T1046 | Reconnaissance |
+| PORT_SCAN | cross-boundary port scanning (distinct ports per target) | T1046 | Reconnaissance |
+| PRIVILEGE_ESCALATION_ATTEMPT | failed sudo/elevation (attempt ≠ success) | T1548.003 | Installation |
+| EXFIL_EXTERNAL | staged upload to external infra (observed transfer) | T1041 | Actions on Objectives |
+| DATA_TRANSFER_CANDIDATE | large outbound transfer (candidate, unconfirmed) | T1041 | Actions on Objectives |
+| WEB_THREAT_BLOCKED | web/AV blocks — attempts observed, not infections | T1189/T1203 | Delivery |
+| IPS_ALERTS | IDS/IPS drops — attempts observed, not compromises | T1203 | Delivery |
+| EDR_TAGGED_ALERT | surfaces pre-tagged EDR alerts (ECS threat fields) | from log | from tactic |
+
+Blocked/failed activity is always described as an attempt; successful authentication
+alone does not assert compromise beyond the account.
+
+## Tests
+
+```powershell
+.venv\Scripts\pip install pytest psutil
+.venv\Scripts\python -m pytest tests\ -q          # 14 tests: parsers (incl. FortiGate),
+                                                  # detectors, correlation, storyboard,
+                                                  # look-ahead, resume, streaming equivalence
+.venv\Scripts\python scripts\smoke_test.py        # headless pipeline test (demo data)
+.venv\Scripts\python scripts\test_workflow.py     # real-HTTP workflow test (server on 8765)
+.venv\Scripts\python scripts\bench_firex.py firex-10G   # large-file ingestion benchmark
+.venv\Scripts\python scripts\run_analysis_bench.py      # streaming-analysis benchmark
+```
 
 ## Architecture
 
 ```
 backend/app
-  config.py            settings & thresholds (no secrets)
-  db.py                SQLite (WAL) disk-backed store, raw evidence preserved
-  ingest/parsers.py    syslog + JSON/JSONL + ECS parsers (auto-detect)
-  ingest/pipeline.py   streaming ingestion (batched, never loads whole files), job progress
+  config.py            settings & thresholds (env-driven; no secrets)
+  db.py                SQLite (WAL) + migrations + incremental severity counters
+  ingest/parsers.py    syslog + JSON/JSONL + ECS + FortiGate parsers
+  ingest/pipeline.py   streaming ingestion (single/multi upload), job registry
+  ingest/folder.py     resumable local-folder ingestion (byte-offset checkpoints)
   ingest/demo.py       deterministic synthetic multi-stage attack dataset
-  analysis/detectors.py  8 deterministic detection rules with explanations & evidence
-  analysis/correlate.py  conservative entity linking (union-find, time windows) -> incidents
-  analysis/mitre.py    ATT&CK catalog + Kill Chain stages
-  analysis/graph.py    attack graph builder (observed vs inferred edges)
-  analysis/engine.py   pipeline orchestration
-  reports.py           incident report (structured + markdown), confirmed vs hypotheses
+  analysis/detectors.py    in-memory rules (small/medium datasets)
+  analysis/fw_detectors.py SQL-first rules (millions of events, bounded evidence)
+  analysis/correlate.py    conservative entity linking -> incidents
+  analysis/storyboard.py   phase-grouped chronological narrative
+  analysis/lookahead.py    potential next targets (INFERRED, evidence-cited)
+  analysis/graph.py        attack graph (observed vs inferred edges)
+  analysis/mitre.py        ATT&CK catalog + Kill Chain stages
+  analysis/engine.py       pipeline orchestration (full / streaming modes)
+  reports.py           incident report (structured + markdown)
   ai/assistant.py      optional GLM provider integration
   api/routes.py        REST API
-frontend/              zero-dependency dark SOC SPA (custom force-directed graph)
-scripts/               smoke tests (headless + HTTP workflow)
+frontend/              dark SOC SPA: Overview, Log Explorer, Investigation
+                       (Storyboard + synchronized graph + look-ahead), Attack Graph,
+                       Entity Explorer, Reports; custom force/timeline graph layouts
+data/                  killchain.db (SQLite), uploads/, demo/, edr_gen/ (gitignored)
 ```
 
-### Detection rules (all deterministic, each cites its evidence)
+## Known limitations
 
-| Rule | Behavior | MITRE | Kill Chain |
-|---|---|---|---|
-| BRUTE_FORCE_AUTH | repeated failed logins per account+source | T1110(.001) | Delivery |
-| SUCCESS_AFTER_FAILURES | success after failure burst | T1078 | Exploitation |
-| SUSPICIOUS_AUTH_ODD_HOUR | night login from first-seen source | T1078.001 | Exploitation |
-| SUSPICIOUS_PROCESS_EXEC | discovery/credential tooling in EDR telemetry | T1033/T1087/T1003/... | Installation |
-| LATERAL_MOVEMENT | internal pivoting, only with suspicious context | T1021.004 | Installation |
-| NETWORK_PROBE_INTERNAL | internal reachability scans | T1046 | Reconnaissance |
-| PRIVILEGE_ESCALATION_ATTEMPT | failed sudo elevation | T1548.003 | Installation |
-| EXFIL_EXTERNAL | staged upload to external infra | T1041 | Actions on Objectives |
-| EDR_TAGGED_ALERT | surfaces pre-tagged EDR alerts (ECS threat fields) | from log | from tactic |
-
-Correlation links events **only** through strong identity relationships (same
-account+source IP, same account on same host, observed host-to-host authentication
-bridges) within bounded time windows — it never merges unrelated suspicious activity.
-Hypotheses (possible next targets, credential reuse) are always explicitly labelled
-**INFERRED**.
-
-## Tests
-
-```powershell
-.venv\Scripts\python scripts\smoke_test.py     # headless pipeline test
-.venv\Scripts\python scripts\test_ecs.py      # hackathon ECS generator end-to-end
-# with the server running:
-.venv\Scripts\python scripts\test_workflow.py # real-HTTP workflow test
-```
-
-## Notes
-
-- Storage: `data/killchain.db` (SQLite, WAL) — delete for a fresh start or use
-  `POST /api/admin/reset`.
-- Ingestion streams files line-by-line in batches; raw log lines are always preserved
-  and viewable as evidence.
-- No secrets are stored in the repository; the AI key is read from the environment.
+- 30-50 GB ingest/analyze is architecturally supported (streaming + SQL-first analysis)
+  but the largest size actually tested on this machine is the 6.54 GB file above.
+- FortiGate sources dedupe by first occurrence of each key per line (standard for these
+  logs); exotic multi-value keys would need format-specific handling when the
+  organizers' real dataset arrives.
+- Single-process ingestion (one file at a time, sequential per job).
+- The AI assistant requires a GLM API key; without it the button shows a clear
+  unavailable state and everything else functions.

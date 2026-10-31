@@ -19,6 +19,19 @@ FRONTEND_DIR = APP_ROOT / "frontend"
 # Ingestion batch size for streaming inserts (keeps memory flat for huge files)
 INGEST_BATCH_SIZE = 1000
 
+# Allowed roots for local-folder ingestion (path separator ';').
+# If unset, only the project directory and its data folder are permitted.
+_default_allowed = f"{APP_ROOT};{DATA_DIR}"
+ALLOWED_DIRS = [os.path.abspath(p) for p in os.environ.get(
+    "KILLCHAIN_ALLOWED_DIRS", _default_allowed).split(";") if p.strip()]
+
+# Analysis strategy: datasets above this event count use the SQL-first
+# streaming path (bounded memory); below it the full in-memory path is used.
+FULL_SCAN_LIMIT = int(os.environ.get("KILLCHAIN_FULL_SCAN_LIMIT", "200000"))
+
+# Folder ingestion file extensions
+FOLDER_EXTENSIONS = {".log", ".jsonl", ".json", ".ndjson", ".txt", ".out"}
+
 # Detection thresholds (deterministic, explainable)
 BRUTEFORCE_FAILURE_COUNT = 5          # failed logins ...
 BRUTEFORCE_WINDOW_MIN = 30            # ... within this window

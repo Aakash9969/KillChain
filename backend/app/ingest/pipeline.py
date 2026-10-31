@@ -49,15 +49,27 @@ class JobRegistry:
         conn = db.get_db()
         conn.execute(
             """INSERT INTO ingest_jobs (id, source_id, filename, origin, status, processed_lines,
-               parsed_events, parse_errors, error_text, started_at, finished_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)
-               ON CONFLICT(id) DO UPDATE SET source_id=excluded.source_id, status=excluded.status,
-               processed_lines=excluded.processed_lines, parsed_events=excluded.parsed_events,
-               parse_errors=excluded.parse_errors, error_text=excluded.error_text,
-               finished_at=excluded.finished_at""",
-            (job["id"], job["source_id"], job["filename"], job["origin"], job["status"],
+               parsed_events, parse_errors, error_text, started_at, finished_at, source_dir,
+               files_total, files_done, current_file, total_bytes, bytes_done, records_read,
+               speed_eps, eta_seconds, resumable)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               ON CONFLICT(id) DO UPDATE SET
+                 source_id=excluded.source_id, status=excluded.status,
+                 processed_lines=excluded.processed_lines, parsed_events=excluded.parsed_events,
+                 parse_errors=excluded.parse_errors, error_text=excluded.error_text,
+                 finished_at=excluded.finished_at, source_dir=excluded.source_dir,
+                 files_total=excluded.files_total, files_done=excluded.files_done,
+                 current_file=excluded.current_file, total_bytes=excluded.total_bytes,
+                 bytes_done=excluded.bytes_done, records_read=excluded.records_read,
+                 speed_eps=excluded.speed_eps, eta_seconds=excluded.eta_seconds,
+                 resumable=excluded.resumable""",
+            (job["id"], job.get("source_id"), job["filename"], job["origin"], job["status"],
              job["processed_lines"], job["parsed_events"], job["parse_errors"],
-             job["error_text"], job["started_at"], job["finished_at"]))
+             job["error_text"], job["started_at"], job["finished_at"],
+             job.get("source_dir"), job.get("files_total", 0), job.get("files_done", 0),
+             job.get("current_file"), job.get("total_bytes", 0), job.get("bytes_done", 0),
+             job.get("records_read", 0), job.get("speed_eps", 0), job.get("eta_seconds"),
+             1 if job.get("resumable") else 0))
         conn.commit()
 
 
@@ -77,11 +89,13 @@ def _ingest_stream(job_id: str, source_id: int, path: Path, format_hint: str) ->
             return
         conn.executemany(
             """INSERT INTO events (source_id, line_no, ts, ts_text, event_type, severity,
-               username, src_ip, dst_ip, host, process, action, outcome, message, details, raw)
+               username, src_ip, dst_ip, dst_port, host, process, action, outcome, message,
+               bytes_out, bytes_in, details, raw)
                VALUES (:source_id, :line_no, :ts, :ts_text, :event_type, :severity,
-               :username, :src_ip, :dst_ip, :host, :process, :action, :outcome, :message,
-               :details, :raw)""",
+               :username, :src_ip, :dst_ip, :dst_port, :host, :process, :action, :outcome, :message,
+               :bytes_out, :bytes_in, :details, :raw)""",
             batch)
+        db.bump_severity_counts(batch)
         conn.commit()
         batch.clear()
 
@@ -98,6 +112,8 @@ def _ingest_stream(job_id: str, source_id: int, path: Path, format_hint: str) ->
                     parsed_ev = parsers.parse_jsonl_line(raw, now)
                 elif fmt == "syslog":
                     parsed_ev = parsers.parse_syslog_line(raw, now)
+                elif fmt == "fortigate":
+                    parsed_ev = parsers.parse_fortigate_line(raw, now)
             except Exception:  # a malformed line must never kill ingestion
                 parsed_ev = None
             if parsed_ev is None:

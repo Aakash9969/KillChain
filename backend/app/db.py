@@ -104,7 +104,12 @@ CREATE TABLE IF NOT EXISTS ingest_jobs (
   resumable INTEGER DEFAULT 0
 );
 
--- per-file checkpoint state for resumable folder ingestion
+-- incremental severity counters (kept fresh by ingestion; avoids full scans
+-- of huge event tables when rendering the dashboard)
+CREATE TABLE IF NOT EXISTS stats_cache (
+  key TEXT PRIMARY KEY,
+  n INTEGER DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS ingest_files (
   id INTEGER PRIMARY KEY,
   job_id TEXT NOT NULL REFERENCES ingest_jobs(id) ON DELETE CASCADE,
@@ -145,7 +150,9 @@ CREATE TABLE IF NOT EXISTS detections (
   killchain_stage TEXT NOT NULL,
   event_ids TEXT NOT NULL,         -- JSON list of event ids
   entities TEXT NOT NULL,          -- JSON dict {users, ips, hosts, processes}
-  first_ts REAL, last_ts REAL
+  first_ts REAL, last_ts REAL,
+  aggregate INTEGER DEFAULT 0,     -- SQL-aggregated rule (evidence is a sample)
+  total_events INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_detections_analysis ON detections(analysis_id);
 
@@ -206,6 +213,37 @@ def _migrate(conn: sqlite3.Connection) -> None:
     ]:
         if col not in jcols:
             conn.execute(ddl)
+    dcols = {r["name"] for r in conn.execute("PRAGMA table_info(detections)")}
+    for col, ddl in [
+        ("aggregate", "ALTER TABLE detections ADD COLUMN aggregate INTEGER DEFAULT 0"),
+        ("total_events", "ALTER TABLE detections ADD COLUMN total_events INTEGER DEFAULT 0"),
+    ]:
+        if col not in dcols:
+            conn.execute(ddl)
+
+
+def bump_severity_counts(batch: list[dict]) -> None:
+    """Incrementally maintain severity counters (avoids full-table GROUP BY
+    on multi-million-row event tables when rendering the dashboard)."""
+    if not batch:
+        return
+    counts: dict[str, int] = {}
+    for e in batch:
+        s = e.get("severity") or "info"
+        counts[s] = counts.get(s, 0) + 1
+    conn = get_db()
+    conn.executemany(
+        """INSERT INTO stats_cache(key, n) VALUES(?, ?)
+           ON CONFLICT(key) DO UPDATE SET n = n + excluded.n""",
+        [(f"sev:{k}", v) for k, v in counts.items()])
+
+
+def get_severity_counts() -> dict[str, int] | None:
+    conn = get_db()
+    rows = conn.execute("SELECT key, n FROM stats_cache WHERE key LIKE 'sev:%'").fetchall()
+    if not rows:
+        return None  # no counters yet -> caller falls back to live aggregation
+    return {r["key"].split(":", 1)[1]: r["n"] for r in rows}
 
 
 def rows_to_dicts(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:

@@ -38,13 +38,15 @@
       this.transform = { x: 0, y: 0, k: 1 };
       this.selected = null;
       this.alpha = 1;
+      this.layoutMode = "timeline";
+      this._eventIndex = null;   // event id -> {nodes:Set, edges:[]}
       this._initPanZoom();
     }
 
     setData(data) {
       this.nodes = []; this.edges = []; this.byId = {};
       this.edgeLayer.innerHTML = ""; this.nodeLayer.innerHTML = ""; this.labelLayer.innerHTML = "";
-      this.selected = null; this.alpha = 1;
+      this.selected = null; this.alpha = 1; this._eventIndex = null;
 
       const W = this.container.clientWidth || 900, H = this.container.clientHeight || 520;
       const rad = Math.min(W, H) * 0.36;
@@ -65,9 +67,160 @@
       });
       this._renderEdges();
       this._renderNodes();
-      this.fit();
-      this.start();
+      this.applyLayout(this.layoutMode);
       if (!this.nodes.length && this.opts.onEmpty) this.opts.onEmpty();
+    }
+
+    /* ---- layouts ---- */
+    applyLayout(mode) {
+      this.layoutMode = mode;
+      if (!this.nodes.length) return;
+      if (mode === "timeline") {
+        this._layoutTimeline();
+        this.fit();
+        this.alpha = 0;
+        if (this._raf) { cancelAnimationFrame(this._raf); this._raf = null; }
+        this._paint();
+      } else {
+        this._layoutForce();
+        this.fit();
+        this.start();
+      }
+    }
+
+    _layoutForce() {
+      const W = this.container.clientWidth || 900, H = this.container.clientHeight || 520;
+      const rad = Math.min(W, H) * 0.36;
+      this.nodes.forEach((n, i) => {
+        const a = (2 * Math.PI * i) / this.nodes.length;
+        n.x = W / 2 + rad * Math.cos(a);
+        n.y = H / 2 + rad * Math.sin(a);
+        n.vx = n.vy = 0;
+      });
+      this.alpha = 1;
+    }
+
+    _layoutTimeline() {
+      /* Left-to-right attack progression:
+         depth = BFS distance from attacker infrastructure over observed edges;
+         nodes stacked per column with collision relaxation. */
+      const W = this.container.clientWidth || 900, H = this.container.clientHeight || 520;
+      const adj = new Map();
+      this.nodes.forEach(n => adj.set(n.id, []));
+      this.edges.forEach(e => {
+        if (e.observed) {
+          adj.get(e.source)?.push(e.target);
+          adj.get(e.target)?.push(e.source);
+        }
+      });
+      const roots = this.nodes.filter(n => n.role === "attacker_infra").map(n => n.id);
+      if (!roots.length) {
+        const host = this.nodes.filter(n => n.kind === "host")
+          .sort((a, b) => b.deg - a.deg)[0];
+        if (host) roots.push(host.id);
+      }
+      const depth = new Map();
+      roots.forEach(r => depth.set(r, 0));
+      let queue = [...roots];
+      while (queue.length) {
+        const next = [];
+        for (const id of queue) {
+          for (const nb of adj.get(id) || []) {
+            if (!depth.has(nb)) { depth.set(nb, depth.get(id) + 1); next.push(nb); }
+          }
+        }
+        queue = next;
+      }
+      for (const n of this.nodes) {
+        if (depth.has(n.id)) continue;
+        let d = 0;
+        for (const nb of adj.get(n.id) || []) d = Math.max(d, (depth.get(nb) ?? -1) + 1);
+        depth.set(n.id, d);
+      }
+      const cols = new Map();
+      this.nodes.forEach(n => {
+        const d = depth.get(n.id) ?? 0;
+        if (!cols.has(d)) cols.set(d, []);
+        cols.get(d).push(n);
+      });
+      const kindOrder = { ip: 0, user: 1, host: 2, process: 3 };
+      const colKeys = [...cols.keys()].sort((a, b) => a - b);
+      const colGap = Math.min(240, (W - 170) / Math.max(1, colKeys.length - 1));
+      const x0 = 95;
+      for (const d of colKeys) {
+        const col = cols.get(d).sort((a, b) =>
+          (kindOrder[a.kind] ?? 9) - (kindOrder[b.kind] ?? 9) ||
+          String(a.label).localeCompare(String(b.label)));
+        const n = col.length;
+        const usable = H - 130;
+        col.forEach((node, i) => {
+          node.x = x0 + d * colGap;
+          node.y = n === 1 ? H / 2 : 75 + (usable * i) / Math.max(1, n - 1);
+        });
+      }
+      for (let sweep = 0; sweep < 40; sweep++) {
+        for (const d of colKeys) {
+          const col = cols.get(d);
+          col.sort((a, b) => a.y - b.y);
+          for (let i = 1; i < col.length; i++) {
+            if (col[i].y - col[i - 1].y < 48) col[i].y = col[i - 1].y + 48;
+          }
+          const overflow = col[col.length - 1].y - (H - 60);
+          if (overflow > 0) col.forEach(node => { node.y -= overflow; });
+          if (col[0].y < 60) col.forEach(node => { node.y += 60 - col[0].y; });
+        }
+      }
+    }
+
+    /* ---- selection & sync helpers ---- */
+    _buildEventIndex() {
+      if (this._eventIndex) return this._eventIndex;
+      const idx = new Map();
+      this.edges.forEach((e, i) => {
+        (e.event_ids || []).forEach(eid => {
+          if (!idx.has(eid)) idx.set(eid, { nodeIds: new Set(), edges: [] });
+          idx.get(eid).nodeIds.add(e.source);
+          idx.get(eid).nodeIds.add(e.target);
+          idx.get(eid).edges.push(i);
+        });
+      });
+      this._eventIndex = idx;
+      return idx;
+    }
+
+    /* Highlight graph parts touching the given event ids (storyboard sync). */
+    highlightByEvents(eventIds, keepSelection) {
+      if (!keepSelection) this._deselect();
+      const idx = this._buildEventIndex();
+      const nodeIds = new Set(), edgeSet = new Set();
+      (eventIds || []).forEach(eid => {
+        const hit = idx.get(eid);
+        if (!hit) return;
+        hit.nodeIds.forEach(n => nodeIds.add(n));
+        hit.edges.forEach(i => edgeSet.add(i));
+      });
+      this.nodes.forEach(n => {
+        n.el.classList.toggle("dim", nodeIds.size > 0 && !nodeIds.has(n.id));
+        n.el.classList.toggle("selected", nodeIds.has(n.id));
+      });
+      this.edges.forEach((e, i) => {
+        e.el.classList.toggle("selected", edgeSet.has(i));
+        e.el.style.opacity = (edgeSet.size > 0 && !edgeSet.has(i)) ? 0.15 : "";
+      });
+      return { nodeIds: [...nodeIds], edgeCount: edgeSet.size };
+    }
+
+    clearHighlight() {
+      this.nodes.forEach(n => n.el.classList.remove("dim", "selected"));
+      this.edges.forEach(e => { e.el.classList.remove("selected"); e.el.style.opacity = ""; });
+    }
+
+    /* Storyboard event ids related to a node (graph -> storyboard sync). */
+    eventsForNode(nodeId) {
+      const idx = this._buildEventIndex();
+      const out = new Set();
+      idx.forEach((hit, eid) => { if (hit.nodeIds.has(nodeId)) out.add(eid); });
+      return [...out];
     }
 
     _renderEdges() {
@@ -157,6 +310,19 @@
 
     _step() {
       const N = this.nodes, W = this.container.clientWidth, H = this.container.clientHeight;
+      if (this.layoutMode === "timeline") {
+        // in timeline layout physics are off; only dragged nodes move
+        let any = false;
+        N.forEach(n => {
+          if (n._drag) {
+            n.x = Math.max(40, Math.min(W - 40, n.x));
+            n.y = Math.max(40, Math.min(H - 40, n.y));
+            any = true;
+          }
+        });
+        if (any) this._paint();
+        return;
+      }
       this.alpha *= 0.992;
       const rep = 2600, kAttr = 0.03;
       for (let i = 0; i < N.length; i++) {

@@ -7,11 +7,13 @@ from fastapi.staticfiles import StaticFiles
 
 from . import config, db
 from .api.routes import router
+from .ingest.folder import mark_interrupted_jobs
 
 app = FastAPI(title="KillChain", version="1.0.0",
               description="Cybersecurity attack reconstruction platform")
 
 db.init_db()
+mark_interrupted_jobs()  # folder jobs left 'running' by a previous process
 app.include_router(router)
 
 # Frontend SPA (registered after /api so API routes take precedence)

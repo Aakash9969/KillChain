@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, File, HTTPException, UploadFile
+from pathlib import Path
 from pydantic import BaseModel
 
 from .. import config, db
@@ -35,8 +36,12 @@ def status():
 def stats():
     conn = db.get_db()
     total = conn.execute("SELECT COUNT(*) c FROM events").fetchone()["c"]
-    sev_dist = {r["severity"]: r["c"] for r in conn.execute(
-        "SELECT severity, COUNT(*) c FROM events GROUP BY severity")}
+    sev_cached = db.get_severity_counts()
+    if sev_cached is not None:
+        sev_dist = sev_cached
+    else:
+        sev_dist = {r["severity"]: r["c"] for r in conn.execute(
+            "SELECT severity, COUNT(*) c FROM events GROUP BY severity")}
 
     an_id = engine.latest_analysis_id(conn)
     analysis = None
@@ -110,6 +115,19 @@ class DemoIngestBody(BaseModel):
     pass  # no options needed; endpoint regenerates the synthetic files
 
 
+class FolderScanBody(BaseModel):
+    path: str
+
+
+class FolderStartBody(BaseModel):
+    path: str
+    files: list[str]
+
+
+class FolderResumeBody(BaseModel):
+    job_id: str
+
+
 @router.post("/ingest/demo")
 def ingest_demo(body: DemoIngestBody | None = None):
     files = demo.generate_demo_files()
@@ -122,15 +140,61 @@ def ingest_demo(body: DemoIngestBody | None = None):
 
 
 @router.post("/ingest/upload")
-async def ingest_upload(file: UploadFile = File(...), fmt: str = "auto"):
+async def ingest_upload(file: UploadFile = File(None), files: list[UploadFile] = File(None),
+                        fmt: str = "auto"):
+    """Upload one or multiple log files; each is ingested through the same pipeline."""
+    uploads = [f for f in ([file] if file else []) + (files or []) if f is not None]
+    if not uploads:
+        raise HTTPException(400, "No files provided")
     updir = config.DATA_DIR / "uploads"
     updir.mkdir(parents=True, exist_ok=True)
-    safe = Path(file.filename or "upload.log").name
-    dest = updir / f"{uuid.uuid4().hex[:8]}_{safe}"
-    with open(dest, "wb") as out:
-        shutil.copyfileobj(file.file, out)
-    job_id = pipeline.start_ingestion(dest, safe, fmt, origin="upload")
-    return {"job_id": job_id, "filename": safe}
+    jobs = []
+    for f in uploads:
+        safe = Path(f.filename or "upload.log").name  # strip any path components
+        if not safe or safe in (".", ".."):
+            raise HTTPException(400, "Invalid filename")
+        dest = updir / f"{uuid.uuid4().hex[:8]}_{safe}"
+        with open(dest, "wb") as out:
+            shutil.copyfileobj(f.file, out)
+        job_id = pipeline.start_ingestion(dest, safe, fmt, origin="upload")
+        jobs.append({"job_id": job_id, "filename": safe, "size": dest.stat().st_size})
+    return {"jobs": jobs}
+
+
+@router.post("/ingest/folder/scan")
+def folder_scan(body: FolderScanBody):
+    from ..ingest import folder
+    return folder.scan_folder(body.path)
+
+
+@router.post("/ingest/folder/start")
+def folder_start(body: FolderStartBody):
+    from ..ingest import folder
+    directory, err = folder.validate_dir(body.path)
+    if err:
+        raise HTTPException(400, err)
+    if not body.files:
+        raise HTTPException(400, "No files selected")
+    # re-validate every selected file against permitted roots (no traversal)
+    for fp in body.files:
+        if not folder.path_allowed(Path(fp)):
+            raise HTTPException(400, f"File not permitted: {Path(fp).name}")
+        p = Path(fp)
+        if not p.is_file():
+            raise HTTPException(400, f"File not found: {p.name}")
+    job_id = folder.create_folder_job(str(directory), body.files)
+    folder.start_folder_job(job_id)
+    return {"job_id": job_id, "files": len(body.files),
+            "total_bytes": sum(Path(f).stat().st_size for f in body.files)}
+
+
+@router.post("/ingest/folder/resume")
+def folder_resume(body: FolderResumeBody):
+    from ..ingest import folder
+    result = folder.resume_job(body.job_id)
+    if not result.get("ok"):
+        raise HTTPException(400, result.get("error", "Resume failed"))
+    return result
 
 
 @router.post("/ingest/edr-gen")
@@ -162,12 +226,22 @@ def ingest_edr_gen(count: int = 800, alert_ratio: float = 0.08):
 @router.get("/ingest/status/{job_id}")
 def ingest_status(job_id: str):
     job = pipeline.JOBS.get(job_id)
+    conn = db.get_db()
+    files = None
+    dbjob = conn.execute("SELECT * FROM ingest_jobs WHERE id=?", (job_id,)).fetchone()
+    if dbjob and dbjob["origin"] == "folder":
+        files = [dict(r) for r in conn.execute(
+            "SELECT id, path, name, format, byte_size, status, byte_offset, line_no, "
+            "parsed_events, parse_errors, error_text FROM ingest_files WHERE job_id=? "
+            "ORDER BY id", (job_id,))]
+        job = {**dict(dbjob), **(job or {})}
     if job is None:
-        conn = db.get_db()
-        row = conn.execute("SELECT * FROM ingest_jobs WHERE id=?", (job_id,)).fetchone()
-        if not row:
+        if dbjob:
+            job = dict(dbjob)
+        else:
             raise HTTPException(404, "Unknown job")
-        job = dict(row)
+    if files is not None:
+        job["files"] = files
     return job
 
 
@@ -262,8 +336,12 @@ def incident_detail(incident_id: int):
     events = engine.get_incident_events(conn, inc["event_ids"])
     dets = engine.get_incident_detections(conn, inc["detection_ids"])
     graph = build_graph(inc, events, dets)
+    from ..analysis.lookahead import build_lookahead
+    from ..analysis.storyboard import build_storyboard
     det_view = [_det_row({**d, "analysis_id": inc["analysis_id"]}) for d in dets]
-    return {"incident": inc, "events": events, "detections": det_view, "graph": graph}
+    return {"incident": inc, "events": events, "detections": det_view, "graph": graph,
+            "storyboard": build_storyboard(inc, events, dets),
+            "lookahead": build_lookahead(events, dets)}
 
 
 @router.get("/incidents/{incident_id}/report")
@@ -376,7 +454,8 @@ def admin_reset():
     conn = db.get_db()
     try:
         with conn:  # atomic; rolls back automatically on error
-            for table in ("incidents", "detections", "analyses", "events", "ingest_jobs", "sources"):
+            for table in ("incidents", "detections", "analyses", "events", "ingest_jobs",
+                          "ingest_files", "stats_cache", "sources"):
                 conn.execute(f"DELETE FROM {table}")
             try:
                 conn.execute("DELETE FROM sqlite_sequence")

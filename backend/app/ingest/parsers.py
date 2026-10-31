@@ -52,9 +52,11 @@ def _ev(**kw: Any) -> dict[str, Any]:
     kw.setdefault("severity", "info")
     kw.setdefault("outcome", "unknown")
     # every canonical column must exist (None if absent) for batch SQL inserts
-    for f in ("ts", "ts_text", "username", "src_ip", "dst_ip", "host", "process",
+    for f in ("ts", "ts_text", "username", "src_ip", "dst_ip", "dst_port", "host", "process",
               "action", "message", "details"):
         kw.setdefault(f, None)
+    kw.setdefault("bytes_out", 0)
+    kw.setdefault("bytes_in", 0)
     if kw.get("details") is not None and not isinstance(kw["details"], dict):
         kw["details"] = {"value": kw["details"]}
     return kw
@@ -414,8 +416,10 @@ def parse_fortigate_line(line: str, now: datetime) -> dict[str, Any] | None:
     msg = fields.get("msg") or fields.get("logdesc") or ""
 
     event_type, outcome, ev_action, severity = "other", "unknown", None, sev
+    if status == "failed":
+        status = "failure"  # FortiGate uses 'failed'; canonical outcome is 'failure'
     if ftype == "event" and subtype == "system" and action == "login":
-        event_type = "auth_failure" if status == "failed" else "auth_success"
+        event_type = "auth_failure" if status == "failure" else "auth_success"
         outcome = status if status in ("success", "failure") else "unknown"
         ev_action = "admin_login"
         # admin-interface authentication failures are worth more than a typo

@@ -1,10 +1,16 @@
-"""Analysis engine: runs the deterministic pipeline and persists results."""
+"""Analysis engine: runs the deterministic pipeline and persists results.
+
+Two strategies, chosen by dataset size (config.FULL_SCAN_LIMIT):
+  * full path   - events loaded once, all detectors run in memory (small data)
+  * streaming   - SQL-first aggregations with bounded memory (millions of events);
+                  incident assembly via campaign clustering over detections
+"""
 from __future__ import annotations
 
 import sqlite3
 
-from .. import db
-from . import correlate, detectors, mitre
+from .. import config, db
+from . import correlate, detectors, fw_detectors, mitre
 
 
 def run_analysis(is_demo: bool = True) -> dict:
@@ -15,24 +21,29 @@ def run_analysis(is_demo: bool = True) -> dict:
     conn.commit()
 
     try:
-        events = []
-        for row in conn.execute(
-                "SELECT * FROM events WHERE ts IS NOT NULL ORDER BY ts, id"):
-            e = dict(row)
-            e["details"] = db.jload(e.get("details"), {})
-            events.append(e)
-
-        detections = detectors.run_all_detectors(events)
+        n = conn.execute("SELECT COUNT(*) c FROM events WHERE ts IS NOT NULL").fetchone()["c"]
+        mode = "full" if n <= config.FULL_SCAN_LIMIT else "streaming"
+        if mode == "streaming":
+            # covering index for network aggregations (built once; later runs reuse it)
+            conn.execute("""CREATE INDEX IF NOT EXISTS idx_net_pair ON events
+                            (src_ip, dst_ip, dst_port) WHERE event_type='network'""")
+            conn.commit()
+        if mode == "full":
+            events, detections = _analyze_full(conn)
+        else:
+            events, detections = _analyze_streaming(conn)
         incidents = correlate.build_incidents(events, detections, analysis_id, is_demo)
 
         for d in detections:
             conn.execute(
                 """INSERT INTO detections (analysis_id, rule_id, title, severity, explanation,
-                   confidence, mitre, killchain_stage, event_ids, entities, first_ts, last_ts)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   confidence, mitre, killchain_stage, event_ids, entities, first_ts, last_ts,
+                   aggregate, total_events)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (analysis_id, d["rule_id"], d["title"], d["severity"], d["explanation"],
                  d["confidence"], db.jdump(d["mitre"]), d["killchain_stage"],
-                 db.jdump(d["event_ids"]), db.jdump(d["entities"]), d["first_ts"], d["last_ts"]))
+                 db.jdump(d["event_ids"]), db.jdump(d["entities"]), d["first_ts"], d["last_ts"],
+                 1 if d.get("aggregate") else 0, d.get("total_events", 0)))
 
         for inc in incidents:
             dets = inc.pop("_detections")
@@ -50,18 +61,191 @@ def run_analysis(is_demo: bool = True) -> dict:
 
         conn.execute(
             """UPDATE analyses SET finished_at=?, status='done', events_analyzed=?,
-               detections=?, incidents=? WHERE id=?""",
-            (db.now(), len(events), len(detections), len(incidents), analysis_id))
+               detections=?, incidents=?, note=? WHERE id=?""",
+            (db.now(), n, len(detections), len(incidents), f"mode={mode}", analysis_id))
         conn.commit()
         return {
-            "analysis_id": analysis_id, "events_analyzed": len(events),
+            "analysis_id": analysis_id, "events_analyzed": n,
             "detections": len(detections), "incidents": len(incidents), "status": "done",
+            "mode": mode,
         }
     except Exception as exc:
         conn.execute("UPDATE analyses SET finished_at=?, status='error', note=? WHERE id=?",
                      (db.now(), str(exc), analysis_id))
         conn.commit()
         raise
+
+
+# ---------------------------------------------------------------------------
+# Full in-memory path (small/medium datasets) - unchanged behavior
+# ---------------------------------------------------------------------------
+def _analyze_full(conn: sqlite3.Connection):
+    events = []
+    for row in conn.execute(
+            "SELECT * FROM events WHERE ts IS NOT NULL ORDER BY ts, id"):
+        e = dict(row)
+        e["details"] = db.jload(e.get("details"), {})
+        events.append(e)
+    detections = detectors.run_all_detectors(events)
+    return events, detections
+
+
+def _load_events_by_type(conn: sqlite3.Connection, event_type: str, limit=200_000) -> list[dict]:
+    out = []
+    for row in conn.execute(
+            "SELECT * FROM events WHERE event_type=? AND ts IS NOT NULL ORDER BY ts, id LIMIT ?",
+            (event_type, limit)):
+        e = dict(row)
+        e["details"] = db.jload(e.get("details"), {})
+        out.append(e)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Streaming path (large datasets): SQL aggregations + bounded evidence
+# ---------------------------------------------------------------------------
+def _analyze_streaming(conn: sqlite3.Connection):
+    detections = fw_detectors.run_streaming_detectors(conn)
+    # de-duplicate overlapping rules on identical first-event anchors
+    seen: set[tuple] = set()
+    uniq = []
+    for d in detections:
+        key = (d["rule_id"], d["event_ids"][0] if d["event_ids"] else None)
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(d)
+    detections = uniq
+
+    events = _events_for_detections(conn, detections)
+    return events, detections
+
+
+def _events_for_detections(conn: sqlite3.Connection, detections: list[dict],
+                           enrich_cap=2000) -> list[dict]:
+    """Materialize the (small) set of detection-backed events plus bounded
+    supporting context - never the full dataset."""
+    ids: set[int] = set()
+    for d in detections:
+        ids.update(d["event_ids"][:600])
+    # campaign clusters define incidents; enrich each cluster afterwards
+    clusters = _campaign_clusters(detections)
+    enriched: set[int] = set(ids)
+    for cluster in clusters:
+        cluster_ids = set()
+        users: set[str] = set()
+        hosts: set[str] = set()
+        ips: set[str] = set()
+        tss: list[float] = []
+        for d in cluster:
+            cluster_ids.update(d["event_ids"][:600])
+            users.update((d["entities"] or {}).get("users") or [])
+            hosts.update((d["entities"] or {}).get("hosts") or [])
+            ips.update((d["entities"] or {}).get("ips") or [])
+            if d.get("first_ts"):
+                tss.append(d["first_ts"])
+            if d.get("last_ts"):
+                tss.append(d["last_ts"])
+        if not tss:
+            continue
+        span0, span1 = min(tss) - 1800, max(tss) + 1800
+        # bounded supporting context: same account or same host inside the span
+        q_parts, q_args = [], []
+        for u in list(users)[:12]:
+            q_parts.append("username=?")
+            q_args.append(u)
+        for h in list(hosts)[:8]:
+            q_parts.append("host=?")
+            q_args.append(h)
+        if not q_parts:
+            continue
+        placeholders = ",".join("?" * len(cluster_ids)) or "NULL"
+        base_args = list(q_args) + [span0, span1] + list(cluster_ids)
+        rows = conn.execute(
+            f"""SELECT * FROM events WHERE ts IS NOT NULL AND ({' OR '.join(q_parts)})
+                AND ts BETWEEN ? AND ?
+                AND id NOT IN ({placeholders})
+                ORDER BY ts LIMIT ?""",
+            (*base_args, enrich_cap))
+        for r in rows:
+            enriched.add(r["id"])
+    # fetch final event set in chunks (bounded by detections + enrichment)
+    out: list[dict] = []
+    id_list = sorted(enriched)
+    for i in range(0, len(id_list), 900):
+        ph = ",".join("?" * len(id_list[i:i + 900]))
+        for row in conn.execute(f"SELECT * FROM events WHERE id IN ({ph})",
+                                id_list[i:i + 900]):
+            e = dict(row)
+            e["details"] = db.jload(e.get("details"), {})
+            out.append(e)
+    out.sort(key=lambda e: (e.get("ts") or 0, e["id"]))
+    return out
+
+
+def _campaign_clusters(detections: list[dict]) -> list[list[dict]]:
+    """Cluster detections into incident seeds.
+
+    Linkage rules (deliberately strict):
+      * detections sharing evidence events are linked;
+      * credential-attack detections on the same host within 24h are one campaign;
+      * credential-attack detections from the same source IP are one campaign;
+      * non-credential detections sharing the same host AND overlapping in time
+        are linked (e.g. process + lateral movement on one machine).
+    """
+    n = len(detections)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    # index by event ids
+    by_event: dict[int, list[int]] = {}
+    for i, d in enumerate(detections):
+        for eid in d["event_ids"][:600]:
+            by_event.setdefault(eid, []).append(i)
+    for group in by_event.values():
+        for a, b in zip(group, group[1:]):
+            union(a, b)
+
+    for i, d in enumerate(detections):
+        ents_i = d.get("entities") or {}
+        for j in range(i + 1, min(i + 400, n)):
+            e2 = detections[j]
+            ents_j = e2.get("entities") or {}
+            same_family_cred = (d["rule_id"] in fw_detectors.CREDENTIAL_FAMILY
+                                and e2["rule_id"] in fw_detectors.CREDENTIAL_FAMILY)
+            hosts_i, hosts_j = set(ents_i.get("hosts") or []), set(ents_j.get("hosts") or [])
+            if same_family_cred and hosts_i & hosts_j:
+                ti, tj = d.get("first_ts") or 0, e2.get("first_ts") or 0
+                if abs(ti - tj) <= 24 * 3600:
+                    union(i, j)
+                    continue
+            if same_family_cred:
+                ips_i = set(ents_i.get("ips") or [])
+                if ips_i & set(ents_j.get("ips") or []):
+                    union(i, j)
+                    continue
+            if (d["rule_id"] not in fw_detectors.CREDENTIAL_FAMILY
+                    and e2["rule_id"] not in fw_detectors.CREDENTIAL_FAMILY
+                    and hosts_i & hosts_j):
+                ti, tj = d.get("first_ts") or 0, e2.get("first_ts") or 0
+                ti2, tj2 = d.get("last_ts") or ti, e2.get("last_ts") or tj
+                if ti <= tj2 and tj <= ti2:  # time overlap
+                    union(i, j)
+
+    clusters: dict[int, list[dict]] = {}
+    for i, d in enumerate(detections):
+        clusters.setdefault(find(i), []).append(d)
+    return list(clusters.values())
 
 
 def _progressions(detections: list[dict]) -> list[dict]:
@@ -137,6 +321,7 @@ def _load_detections(conn: sqlite3.Connection, detection_ids: list[str]) -> list
             d["mitre"] = db.jload(d["mitre"], [])
             d["event_ids"] = db.jload(d["event_ids"], [])
             d["entities"] = db.jload(d["entities"], {})
+            d["aggregate"] = bool(d.get("aggregate"))
             out.append(d)
     out.sort(key=lambda d: -detectors.SEV_RANK.get(d["severity"], 0))
     return out

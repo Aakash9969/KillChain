@@ -53,6 +53,22 @@ def _incident_context(conn, incident_id: int) -> dict:
         "summary": (e.get("message") or "")[:220],
     } for e in events]
 
+    # storyboard + look-ahead keep the AI grounded on the same narrative the analyst sees
+    from ..analysis.lookahead import build_lookahead
+    from ..analysis.storyboard import build_storyboard
+    sb = build_storyboard(inc, events, dets)
+    sb_view = {"phases": [{"stage": p["stage"], "item_count": p["item_count"],
+                           "items": [{"ts": i["ts"], "action": i["action"],
+                                      "event_ids": i["event_ids"]} for i in p["items"][:25]]}
+                          for p in sb["phases"]],
+               "unsupported_stages": sb["unsupported_stages"]}
+    la = build_lookahead(events, dets)
+    la_view = {"targets": [{"target": t["target"]["label"], "label": t["label"],
+                            "why": t["why"], "confidence": t["confidence"],
+                            "evidence_event_ids": t["evidence_event_ids"][:10]}
+                           for t in la["targets"]],
+               "missing_information": la["missing_information"]}
+
     detections_view = [{
         "rule_id": d["rule_id"], "title": d["title"], "severity": d["severity"],
         "confidence": d["confidence"], "killchain_stage": d["killchain_stage"],
@@ -70,6 +86,8 @@ def _incident_context(conn, incident_id: int) -> dict:
         },
         "detections": detections_view,
         "timeline": timeline,
+        "storyboard": sb_view,
+        "potential_next_targets": la_view,
         "graph_edges": [{"source": e["source"], "target": e["target"], "kind": e["kind"],
                          "observed": e["observed"]} for e in graph["edges"]],
     }

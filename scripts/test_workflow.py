@@ -31,6 +31,7 @@ def main():
                                headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
                                method="POST")
     up = json.load(urllib.request.urlopen(r))
+    up = up["jobs"][0] if "jobs" in up else up
     print("upload:", up["filename"], "job", up["job_id"])
     time.sleep(1.2)
     print("job status:", req("/ingest/status/" + up["job_id"])["status"])

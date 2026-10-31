@@ -4,6 +4,8 @@ from __future__ import annotations
 from . import db
 from .analysis import engine, mitre
 from .analysis import detectors as det_mod
+from .analysis.lookahead import build_lookahead
+from .analysis.storyboard import build_storyboard
 
 
 def build_report(conn, incident_id: int) -> dict:
@@ -65,11 +67,13 @@ def build_report(conn, incident_id: int) -> dict:
         "executive_summary": _exec_summary(inc, dets, events),
         "entry_point": inc.get("entry_point"),
         "progression": inc.get("progressions") or [],
+        "storyboard": build_storyboard(inc, events, dets),
         "affected_entities": inc.get("entities") or {},
         "mitre_mapping": techniques,
         "timeline": timeline,
         "confirmed_findings": confirmed,
         "hypotheses": hypotheses,
+        "lookahead": build_lookahead(events, dets),
         "risk": risk,
         "recommended_next_steps": next_steps,
     }
@@ -144,10 +148,31 @@ def to_markdown(r, timeline, techniques, confirmed, hypotheses) -> str:
         L.append("- No externally-sourced entry point present in the analyzed evidence.")
     L.append("")
     L.append("## 3. Attack progression (Cyber Kill Chain)")
-    for st in r["progression"]:
-        L.append(f"- **{st['stage']}** - {st['description']}")
-        for d in st["detections"]:
-            L.append(f"  - {d['title']} ({d['severity']})")
+    sb = r.get("storyboard") or {}
+    if sb.get("phases"):
+        for ph in sb["phases"]:
+            L.append(f"- **{ph['stage']}** ({ph['item_count']} event(s), "
+                     f"{det_mod.fmt_time(ph['first_ts'])} - {det_mod.fmt_time(ph['last_ts'])}) - "
+                     f"{ph['description']}")
+            for it in ph["items"][:6]:
+                L.append(f"  - {det_mod.fmt_time(it['ts'])}: {it['action']} "
+                         f"[E#{', E#'.join(str(x) for x in it['event_ids'][:4])}]")
+            if ph["item_count"] > 6:
+                L.append(f"  - ... {ph['item_count'] - 6} further event(s) in this phase")
+    else:
+        for st in r["progression"]:
+            L.append(f"- **{st['stage']}** - {st['description']}")
+            for d in st["detections"]:
+                L.append(f"  - {d['title']} ({d['severity']})")
+    if sb.get("unsupported_stages"):
+        L.append(f"- *Not observed in evidence: {', '.join(sb['unsupported_stages'])}*")
+    L.append("")
+    la = r.get("lookahead") or {}
+    if la.get("targets"):
+        L.append("## 3b. Potential next targets (INFERRED - not confirmed compromises)")
+        for t in la["targets"][:10]:
+            L.append(f"- **{t['target']['label']}** ({t['confidence']} confidence) - {t['why']}")
+            L.append(f"  - Evidence: E#{', E#'.join(str(x) for x in t['evidence_event_ids'][:6])}")
     L.append("")
     L.append("## 4. Affected entities")
     for k, v in r["affected_entities"].items():
