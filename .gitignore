@@ -11,3 +11,5 @@ data/
 Thumbs.db
 *.log
 !backend/app/**/*.py
+
+scripts/report_preview.md

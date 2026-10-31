@@ -374,8 +374,15 @@ async def incident_ai(incident_id: int, body: AskBody):
 def admin_reset():
     """Wipe all data for a clean demonstration run."""
     conn = db.get_db()
-    for table in ("incidents", "detections", "analyses", "events", "ingest_jobs", "sources"):
-        conn.execute(f"DELETE FROM {table}")
-    conn.execute("DELETE FROM sqlite_sequence")
-    conn.commit()
+    try:
+        with conn:  # atomic; rolls back automatically on error
+            for table in ("incidents", "detections", "analyses", "events", "ingest_jobs", "sources"):
+                conn.execute(f"DELETE FROM {table}")
+            try:
+                conn.execute("DELETE FROM sqlite_sequence")
+            except sqlite3.OperationalError:
+                pass  # table only exists once AUTOINCREMENT columns are used
+    except Exception:
+        conn.rollback()
+        raise
     return {"ok": True}
