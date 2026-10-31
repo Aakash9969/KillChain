@@ -813,7 +813,7 @@ async function route() {
   } catch (e) {
     root.innerHTML = `<div class="panel"><div class="panel-b"><div class="empty">
       <h2>Something went wrong</h2><p class="mono">${esc(e.message)}</p>
-      <p class="faint small">Is the backend running on :8000?</p></div></div></div>`;
+      <p class="faint small">Is the KillChain backend running? Start it with: <span class="mono">.venv\Scripts\python -m uvicorn backend.app.main:app --port 8765</span></p></div></div></div>`;
   }
 }
 window.addEventListener("hashchange", route);

@@ -17,10 +17,14 @@ interactive attack graph, timeline, AI-assisted investigation and exportable rep
 # from the project root (Windows, Python 3.11+)
 python -m venv .venv
 .venv\Scripts\pip install fastapi "uvicorn[standard]" python-multipart httpx
-.venv\Scripts\python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8000
+.venv\Scripts\python -m uvicorn backend.app.main:app --host 127.0.0.1 --port 8765
 ```
 
-Then open **http://127.0.0.1:8000** (or `start.bat`).
+Then open **http://127.0.0.1:8765** (or run `start.bat`).
+
+> Port note: 8765 is used because port 8000 is commonly occupied by other local
+> dev tools. KillChain serves its own frontend, so any port works — e.g.
+> `--port 9000`.
 
 ### Demo workflow (Checkpoint 1)
 
