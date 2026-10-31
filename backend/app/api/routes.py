@@ -133,6 +133,32 @@ async def ingest_upload(file: UploadFile = File(...), fmt: str = "auto"):
     return {"job_id": job_id, "filename": safe}
 
 
+@router.post("/ingest/edr-gen")
+def ingest_edr_gen(count: int = 800, alert_ratio: float = 0.08):
+    """Run the hackathon-provided EDR log generator (ECS JSON) and ingest the output."""
+    import subprocess
+    import sys
+    out_dir = config.DATA_DIR / "edr_gen"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_file = out_dir / "edr_events.json"
+    if out_file.exists():
+        out_file.unlink()  # the generator appends; start fresh per run
+    gen_script = config.APP_ROOT / "edr_log_generator.py"
+    if not gen_script.exists():
+        raise HTTPException(404, "edr_log_generator.py not found in project root")
+    cmd = [sys.executable, str(gen_script), "--count", str(count),
+           "--output", "file", "--file", str(out_file), "--rate", "0",
+           "--alert-ratio", str(alert_ratio), "--seed", "42"]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    if proc.returncode != 0:
+        raise HTTPException(500, f"EDR generator failed: {proc.stderr[:300]}")
+    job_id = pipeline.start_ingestion(out_file, "edr_events.json (hackathon EDR generator)",
+                                      "jsonl", origin="edr_gen")
+    return {"job_id": job_id, "events_generated": count,
+            "note": "Synthetic EDR telemetry in ECS format produced by the hackathon-provided "
+                    "edr_log_generator.py."}
+
+
 @router.get("/ingest/status/{job_id}")
 def ingest_status(job_id: str):
     job = pipeline.JOBS.get(job_id)
@@ -197,10 +223,11 @@ def get_event(event_id: int):
 # ---------------------------------------------------------------------------
 @router.post("/analysis/run")
 def run_analysis():
-    # demo flag: sources with origin=demo => demo dataset
+    # demo flag: if no user-uploaded (potentially real) sources exist, results are
+    # derived purely from synthetic sources and are labelled as demo data
     conn = db.get_db()
-    n = conn.execute("SELECT COUNT(*) c FROM sources WHERE origin='demo'").fetchone()["c"]
-    result = engine.run_analysis(is_demo=n > 0)
+    uploads = conn.execute("SELECT COUNT(*) c FROM sources WHERE origin='upload'").fetchone()["c"]
+    result = engine.run_analysis(is_demo=uploads == 0)
     return result
 
 

@@ -42,6 +42,25 @@ KILL_CHAIN_STAGES = [
 
 STAGE_ORDER = {name: i for i, (name, _) in enumerate(KILL_CHAIN_STAGES)}
 
+# ATT&CK tactic -> Cyber Kill Chain stage (these are DIFFERENT models; this map
+# is only used when an EDR product tags an alert with a tactic name)
+TACTIC_TO_KILLCHAIN = {
+    "Reconnaissance": "Reconnaissance",
+    "Resource Development": "Weaponization",
+    "Initial Access": "Exploitation",
+    "Execution": "Installation",
+    "Persistence": "Installation",
+    "Privilege Escalation": "Installation",
+    "Defense Evasion": "Installation",
+    "Credential Access": "Exploitation",
+    "Discovery": "Reconnaissance",
+    "Lateral Movement": "Installation",
+    "Collection": "Actions on Objectives",
+    "Command and Control": "Command and Control",
+    "Exfiltration": "Actions on Objectives",
+    "Impact": "Actions on Objectives",
+}
+
 
 def enrich_techniques(ids: list[str]) -> list[dict]:
     out = []

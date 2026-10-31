@@ -10,6 +10,8 @@ import re
 from collections import defaultdict
 from datetime import datetime, timedelta
 
+from . import mitre
+
 SEV_RANK = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 
 PRIVATE_IP = re.compile(r"^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|127\.|169\.254\.|::1|fc)")
@@ -368,6 +370,53 @@ def detect_exfiltration(events: list[dict]) -> list[dict]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# R8: EDR pre-tagged alerts (vendor detections present in the telemetry)
+# ---------------------------------------------------------------------------
+def detect_edr_tagged_alerts(events: list[dict]) -> list[dict]:
+    alerts = [e for e in events if (e.get("details") or {}).get("edr_rule")]
+    groups: dict[tuple, list[dict]] = defaultdict(list)
+    for e in alerts:
+        d = e.get("details") or {}
+        groups[(d["edr_rule"], e.get("host") or "?")].append(e)
+
+    out = []
+    for (rule, host), evs in groups.items():
+        evs.sort(key=lambda e: (e["ts"] or 0))
+        # chain into clusters (same rule + host within 30 min)
+        cluster = [evs[0]]
+        clusters = []
+        for e in evs[1:]:
+            if e.get("ts") and cluster[-1].get("ts") and e["ts"] - cluster[-1]["ts"] <= 1800:
+                cluster.append(e)
+            else:
+                clusters.append(cluster)
+                cluster = [e]
+        clusters.append(cluster)
+
+        for cl in clusters:
+            d0 = cl[0].get("details") or {}
+            tids = sorted({t for e in cl for t in (e.get("details") or {}).get("edr_mitre", [])})
+            tactic = d0.get("edr_tactic") or ""
+            stage = mitre.TACTIC_TO_KILLCHAIN.get(tactic.strip(), "Installation")
+            extra = {k: v for k, v in d0.items()
+                     if k.endswith("_5min") or k.endswith("_60s") or k.startswith("failed_count")}
+            ctx = (f" EDR-reported context: {extra}." if extra else "")
+            sev = max((e["severity"] for e in cl), key=lambda s: SEV_RANK.get(s, 0))
+            out.append(_det(
+                "EDR_TAGGED_ALERT", f"EDR alert: {rule}", sev,
+                f"The EDR product raised rule '{rule}'{f' (tactic: {tactic})' if tactic else ''} on "
+                f"{host} ({len(cl)} event(s), {fmt_time(cl[0]['ts'])} - {fmt_time(cl[-1]['ts'])})."
+                f"{ctx} KillChain independently verified these raw events exist in the ingested "
+                f"telemetry and correlates them with surrounding activity.",
+                "medium", tids, stage, cl,
+                _uniq({"users": [e.get("username") or "?" for e in cl],
+                       "ips": [ip for e in cl for ip in (e.get("src_ip"), e.get("dst_ip")) if ip],
+                       "hosts": [host],
+                       "processes": sorted({e.get("process") or "?" for e in cl})})))
+    return out
+
+
 ALL_RULES = [
     detect_brute_force,
     detect_success_after_failures,
@@ -376,6 +425,7 @@ ALL_RULES = [
     detect_lateral_movement,
     detect_privilege_activity,
     detect_exfiltration,
+    detect_edr_tagged_alerts,
 ]
 
 

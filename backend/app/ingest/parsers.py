@@ -165,6 +165,118 @@ def _parse_iso_ts(value: Any, now: datetime) -> tuple[float | None, str | None]:
         return None, text
 
 
+# ---------------------------------------------------------------------------
+# ECS (Elastic Common Schema) support - used by the hackathon EDR generator
+# ---------------------------------------------------------------------------
+def _ecs(rec: dict, *path: str) -> Any:
+    """Walk nested ECS fields; lists are flattened to their first element."""
+    cur: Any = rec
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return None
+        cur = cur[key]
+    if isinstance(cur, list):
+        return cur[0] if cur else None
+    return cur
+
+
+def parse_ecs(rec: dict, now: datetime) -> dict[str, Any] | None:
+    ts, ts_text = _parse_iso_ts(_ecs(rec, "@timestamp") or _ecs(rec, "timestamp"), now)
+    host = _ecs(rec, "host", "name") or _ecs(rec, "host", "hostname")
+    user = _ecs(rec, "user", "name")
+    if user and _ecs(rec, "user", "domain"):
+        user = f'{_ecs(rec, "user", "domain")}\\{user}'
+    proc = _ecs(rec, "process", "name")
+    cmdline = _ecs(rec, "process", "command_line")
+    src_ip = _ecs(rec, "source", "ip")
+    dst_ip = _ecs(rec, "destination", "ip")
+    dst_port = _ecs(rec, "destination", "port")
+    category = str(_ecs(rec, "event", "category") or "").lower()
+    action = _ecs(rec, "event", "action")
+    outcome = str(_ecs(rec, "event", "outcome") or "unknown").lower()
+    event_id = _ecs(rec, "event", "id")
+    winlog_id = _ecs(rec, "winlog", "event_id")
+    rule_name = _ecs(rec, "rule", "name")
+    rule_sev = str(_ecs(rec, "rule", "severity") or "").lower()
+    mitre_ids = _ecs(rec, "threat", "technique", "id")
+    mitre_names = _ecs(rec, "threat", "technique", "name")
+    tactic = _ecs(rec, "threat", "tactic", "name")
+    dns_q = _ecs(rec, "dns", "question", "name")
+    file_path = _ecs(rec, "file", "path")
+    registry_path = _ecs(rec, "registry", "path")
+    labels_extra = rec.get("labels_extra") or {}
+
+    # canonical event type
+    if category == "authentication":
+        event_type = "auth_failure" if outcome == "failure" else "auth_success"
+        outcome = outcome if outcome in ("success", "failure") else "unknown"
+    elif category == "process":
+        event_type = "process"
+    elif category == "network":
+        event_type = "network"
+    elif category == "file":
+        event_type = "file"
+    elif category == "registry":
+        event_type = "privilege" if "Run\\" in str(registry_path) else "other"
+    else:
+        event_type = "other"
+    if winlog_id == 4625:
+        event_type, outcome = "auth_failure", "failure"
+    if winlog_id == 4624:
+        event_type, outcome = "auth_success", "success"
+
+    message_parts = [str(x) for x in (rule_name, action, cmdline, dns_q, file_path,
+                                      registry_path) if x]
+    message = " - ".join(message_parts[:3]) or f"{category or 'event'} {action or ''}".strip()
+
+    suspicious = bool(cmdline and SUSPICIOUS_HINTS.search(cmdline))
+    if rule_sev in SEVERITY_ORDER:
+        severity = rule_sev
+    elif event_type == "process":
+        severity = "high" if suspicious else "info"
+    elif event_type == "network":
+        severity = "medium" if (suspicious or (dst_ip and is_ext_ip(dst_ip))) else "info"
+    elif event_type in ("auth_failure",):
+        severity = "low"
+    else:
+        severity = "info"
+
+    details: dict[str, Any] = {"ecs": True}
+    if event_id:
+        details["ecs_event_id"] = event_id
+    if cmdline:
+        details["command"] = cmdline
+    if dst_port:
+        details["dst_port"] = dst_port
+    if dst_ip:
+        details["dst_domain"] = _ecs(rec, "destination", "domain")
+    if file_path:
+        details["file_path"] = file_path
+    if registry_path:
+        details["registry_path"] = registry_path
+    if dns_q:
+        details["dns_query"] = dns_q
+    if rule_name:
+        details["edr_rule"] = rule_name
+        if isinstance(mitre_ids, str):
+            mitre_ids = [mitre_ids]
+        details["edr_mitre"] = mitre_ids or []
+        details["edr_tactic"] = tactic
+    for k, v in labels_extra.items():
+        details[str(k)] = v
+
+    return _ev(event_type=event_type, severity=severity, outcome=outcome,
+               username=_norm_user(user), src_ip=str(src_ip) if src_ip else None,
+               dst_ip=str(dst_ip) if dst_ip else None, host=str(host) if host else None,
+               process=str(proc) if proc else None, action=str(action) if action else None,
+               message=message, details=details, ts=ts, ts_text=ts_text)
+
+
+def is_ext_ip(ip: str) -> bool:
+    import re as _re
+    return not _re.match(r"^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|127\.|169\.254\.)", str(ip))
+
+
 KNOWN_EVENT_TYPES = {
     "processcreate": "process", "process_create": "process", "process": "process",
     "networkconnect": "network", "network_connect": "network", "network": "network",
@@ -187,6 +299,14 @@ def parse_jsonl_line(line: str, now: datetime) -> dict[str, Any] | None:
         return None
     if not isinstance(rec, dict):
         return None
+
+    # ECS-format records (hackathon EDR generator) get a dedicated parser
+    if "@timestamp" in rec or "ecs" in rec or ("event" in rec and isinstance(rec["event"], dict)
+                                               and "category" in rec["event"]):
+        try:
+            return parse_ecs(rec, now)
+        except Exception:
+            return None
 
     ts, ts_text = _parse_iso_ts(_pick(rec, "timestamp"), now)
     user = _pick(rec, "user")
