@@ -461,6 +461,8 @@ function originChip(origin) {
   return `<span class="ent-tag" style="border-color:${color}">${esc(label)}</span>`;
 }
 
+function debounce(fn, ms) { let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
+
 /* ================= INVESTIGATIONS ================= */
 function incCard(i) {
   return `<div class="inc-card" onclick="location.hash='#/investigation/${i.id}'">
@@ -814,6 +816,41 @@ function renderLookahead(root, la) {
     <div class="faint small" style="margin-top:8px">⚠ ${esc(la.disclaimer)}</div>
   ` : '<div class="faint small">No potential next targets are supported by the evidence in this incident.</div>';
 }
+
+
+function riskRing(score, sev) {
+  const color = { critical: "#ff4d6a", high: "#ff9f43", medium: "#ffd166", low: "#4dd4ac" }[sev] || "#6b7f9e";
+  const c = 2 * Math.PI * 46;
+  return `<div class="risk-ring"><svg width="108" height="108" viewBox="0 0 108 108">
+    <circle cx="54" cy="54" r="46" fill="none" stroke="#1c2b45" stroke-width="8"/>
+    <circle cx="54" cy="54" r="46" fill="none" stroke="${color}" stroke-width="8" stroke-linecap="round"
+      stroke-dasharray="${(score / 100 * c).toFixed(1)} ${c.toFixed(1)}" transform="rotate(-90 54 54)"
+      style="filter:drop-shadow(0 0 6px ${color}aa)"/></svg>
+    <div class="num" style="color:${color}">${score}<small>RISK / 100</small></div></div>`;
+}
+function mdLite(text) {
+  return esc(text)
+    .replace(/^### (.*)$/gm, '<span class="md-h">$1</span>')
+    .replace(/^## (.*)$/gm, '<span class="md-h">$1</span>')
+    .replace(/^# (.*)$/gm, '<span class="md-h">$1</span>')
+    .replace(/\*\*(.+?)\*\*/g, "<b>$1</b>")
+    .replace(/\[E#(\d+)\]/g, '<span class="evid-chip" onclick="showEvidence($1)">E#$1</span>');
+}
+const TECH_NAMES = {
+  "T1110": "Brute Force", "T1110.001": "Brute Force: Password Guessing", "T1078": "Valid Accounts",
+  "T1078.001": "Valid Accounts: Default Accounts", "T1078.003": "Valid Accounts: Local Accounts",
+  "T1033": "System Owner/User Discovery", "T1016": "System Network Configuration Discovery",
+  "T1087": "Account Discovery", "T1057": "Process Discovery", "T1049": "System Network Connections Discovery",
+  "T1046": "Network Service Discovery", "T1003": "OS Credential Dumping",
+  "T1003.008": "/etc/passwd and /etc/shadow", "T1021": "Remote Services", "T1021.004": "Remote Services: SSH",
+  "T1059.001": "PowerShell", "T1548": "Abuse Elevation Control Mechanism",
+  "T1548.003": "Sudo and Sudo Caching", "T1005": "Data from Local System",
+  "T1041": "Exfiltration Over C2 Channel", "T1567": "Exfiltration Over Web Service",
+  "T1071.001": "Web Protocols", "T1547.001": "Registry Run Keys / Startup Folder",
+  "T1486": "Data Encrypted for Impact",
+};
+function techniqueName(id) { return TECH_NAMES[id] || "MITRE ATT&CK technique"; }
+
 
 /* ================= ATTACK GRAPH PAGE ================= */
 async function viewGraph(root) {

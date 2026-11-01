@@ -486,3 +486,6 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 12.5px; }
 }
 .toast.err { border-left-color: var(--critical); }
 @keyframes slidein { from { transform: translateY(12px); opacity: 0; } }
+
+/* folder file-selection checkboxes */
+.fsel { accent-color: #38e1ff; width: 15px; height: 15px; cursor: pointer; }
