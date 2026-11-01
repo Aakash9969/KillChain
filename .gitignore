@@ -48,3 +48,10 @@ Thumbs.db
 edr_events.json
 firex-*.log
 data
+
+scripts/_*.py
+scripts/_*.js
+scripts/profile_*.txt
+scripts/server_log.txt
+scripts/workflow_out.txt
+scripts/verify_out.txt
