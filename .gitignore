@@ -44,3 +44,7 @@ scripts/report_preview.md
 Thumbs.db
 .vscode/
 .idea/
+# large datasets / generated telemetry
+edr_events.json
+firex-*.log
+data

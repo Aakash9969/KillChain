@@ -424,11 +424,17 @@ def parse_fortigate_line(line: str, now: datetime) -> dict[str, Any] | None:
         ev_action = "admin_login"
         # admin-interface authentication failures are worth more than a typo
         severity = "medium" if event_type == "auth_failure" else "info"
-    elif ftype == "event" and subtype == "vpn" and action in ("ssl-login", "tunnel-up"):
-        event_type = "auth_failure" if status == "failed" else "auth_success"
-        outcome = status if status in ("success", "failure") else "unknown"
-        ev_action = "vpn_login"
-        severity = "medium" if event_type == "auth_failure" else "info"
+    elif ftype == "event" and subtype == "vpn":
+        # genuine VPN logins carry a status; tunnel statistics / phase messages
+        # are routine noise even when they carry a user field
+        msg_l = (msg or "").lower()
+        if status in ("success", "failure") and "statistics" not in msg_l:
+            event_type = "auth_failure" if status == "failure" else "auth_success"
+            outcome = status
+            ev_action = "vpn_login"
+            severity = "medium" if event_type == "auth_failure" else "info"
+        else:
+            event_type, ev_action, outcome = "other", "vpn", "unknown"
     elif ftype == "traffic" or subtype == "forward":
         event_type, ev_action = "network", "forward"
         outcome = "success" if action == "accept" else "failure" if action in ("deny", "blocked", "dropped") else "unknown"

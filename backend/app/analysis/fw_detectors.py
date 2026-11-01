@@ -117,82 +117,108 @@ def detect_targeted_bruteforce(conn: sqlite3.Connection, min_total=50, min_ips=5
     return out
 
 
-def detect_success_after_failures_large(conn: sqlite3.Connection, window_s=3600,
-                                        min_failures=3) -> list[dict]:
-    """Stream the (rare) successful logins; each is checked against prior failures."""
+def detect_auth_transitions_large(conn: sqlite3.Connection, window_s=3600,
+                                  min_failures=3, odd_start=22, odd_end=6) -> list[dict]:
+    """Single ordered pass over all authentication events, grouped by
+    (username, src_ip): computes success-after-failures and odd-hour
+    first-seen logins without per-row queries. Memory is bounded by the
+    largest single (account, source) group.
+    """
     out = []
     cur = conn.execute(
-        """SELECT id, ts, username, src_ip, host, message, ts_text FROM events
-           WHERE event_type='auth_success' AND username IS NOT NULL AND src_ip IS NOT NULL
-           ORDER BY ts, id""")
+        """SELECT event_type, ts, id, username, src_ip, host, message
+           FROM events
+           WHERE event_type IN ('auth_failure', 'auth_success')
+             AND username IS NOT NULL AND src_ip IS NOT NULL AND ts IS NOT NULL
+           ORDER BY username, src_ip, ts, id""")
+
+    def make_success_det(s, fails, host):
+        fails = fails[:100]
+        success_ev = {"id": s["id"], "ts": s["ts"], "username": s["username"],
+                      "host": s["host"], "src_ip": s["src_ip"], "message": s["message"]}
+        return _mk(
+            "SUCCESS_AFTER_FAILURES", "Successful login after repeated failures", "critical",
+            f"Account '{s['username']}' successfully authenticated to {host} from "
+            f"{s['src_ip']} at {det_mod.fmt_time(s['ts'])} after {len(fails)} failed attempts "
+            f"from the same source within the previous {window_s // 60} minutes. This is the "
+            f"classic signature of a credential attack succeeding - the account should be "
+            f"treated as compromised.",
+            "high", ["T1078", "T1110"], "Exploitation", fails + [success_ev],
+            {"users": [s["username"]], "ips": [s["src_ip"]],
+             "hosts": sorted({f.get("host") or "?" for f in fails} | {host or "?"}),
+             "processes": []})
+
+    def make_odd_det(s, host):
+        ev = {"id": s["id"], "ts": s["ts"], "username": s["username"], "host": host,
+              "src_ip": s["src_ip"], "message": s["message"]}
+        return _mk(
+            "SUSPICIOUS_AUTH_ODD_HOUR",
+            "Login outside business hours from a first-seen source", "medium",
+            f"Account '{s['username']}' authenticated to {host} from external IP "
+            f"{s['src_ip']} at {det_mod.fmt_time(s['ts'])} - during night hours "
+            f"({odd_start}:00-{odd_end}:00) - and this IP had never been observed for this "
+            f"account before in the analyzed data.",
+            "medium", ["T1078.001", "T1078"], "Exploitation", [ev],
+            {"users": [s["username"]], "ips": [s["src_ip"]], "hosts": [host or "?"],
+             "processes": []})
+
+    group_key = None
+    fail_buf: list[dict] = []   # failures within the window for the current group
+    first_ts = None
+
+    def flush_group(successes):
+        # successes for this group were collected while walking it
+        return successes
+
+    successes = []
     while True:
-        rows = cur.fetchmany(500)
+        rows = cur.fetchmany(2000)
         if not rows:
             break
-        for s in rows:
-            n = conn.execute(
-                """SELECT COUNT(*) c FROM events WHERE event_type='auth_failure'
-                   AND username=? AND src_ip=? AND ts IS NOT NULL AND ts BETWEEN ? AND ?""",
-                (s["username"], s["src_ip"], s["ts"] - window_s, s["ts"])).fetchone()["c"]
-            if n < min_failures:
-                continue
-            fails = [dict(x) for x in conn.execute(
-                """SELECT id, ts, username, host, src_ip, message FROM events
-                   WHERE event_type='auth_failure' AND username=? AND src_ip=?
-                   AND ts BETWEEN ? AND ? ORDER BY ts LIMIT 100""",
-                (s["username"], s["src_ip"], s["ts"] - window_s, s["ts"]))]
-            success_ev = dict(conn.execute(
-                "SELECT id, ts, username, host, src_ip, message FROM events WHERE id=?",
-                (s["id"],)).fetchone())
-            out.append(_mk(
-                "SUCCESS_AFTER_FAILURES", "Successful login after repeated failures", "critical",
-                f"Account '{s['username']}' successfully authenticated to {s['host']} from "
-                f"{s['src_ip']} at {det_mod.fmt_time(s['ts'])} after {n} failed attempts from the "
-                f"same source within the previous {window_s // 60} minutes. This is the classic "
-                f"signature of a credential attack succeeding - the account should be treated "
-                f"as compromised.",
-                "high", ["T1078", "T1110"], "Exploitation", fails + [success_ev],
-                {"users": [s["username"]], "ips": [s["src_ip"]],
-                 "hosts": sorted({x["host"] or "?" for x in fails} | {s["host"] or "?"}),
-                 "processes": []}))
-    return out
-
-
-def detect_odd_hour_large(conn: sqlite3.Connection, odd_start=22, odd_end=6) -> list[dict]:
-    """Odd-hour successful logins from a first-seen external source (streamed)."""
-    out = []
-    cur = conn.execute(
-        """SELECT id, ts, username, src_ip, host, message FROM events
-           WHERE event_type='auth_success' AND username IS NOT NULL AND src_ip IS NOT NULL
-           ORDER BY ts, id""")
-    while True:
-        rows = cur.fetchmany(500)
-        if not rows:
-            break
-        for s in rows:
-            if not det_mod.is_external(s["src_ip"]):
-                continue
-            hour = det_mod.datetime.fromtimestamp(s["ts"]).hour
-            if not (hour >= odd_start or hour < odd_end):
-                continue
-            first = conn.execute(
-                "SELECT MIN(ts) m FROM events WHERE username=? AND src_ip=?",
-                (s["username"], s["src_ip"])).fetchone()["m"]
-            if first is None or abs(first - s["ts"]) > 1:
-                continue
-            ev = dict(conn.execute(
-                "SELECT id, ts, username, host, src_ip, message FROM events WHERE id=?",
-                (s["id"],)).fetchone())
-            out.append(_mk(
-                "SUSPICIOUS_AUTH_ODD_HOUR",
-                "Login outside business hours from a first-seen source", "medium",
-                f"Account '{s['username']}' authenticated to {s['host']} from external IP "
-                f"{s['src_ip']} at {det_mod.fmt_time(s['ts'])} - during night hours "
-                f"({odd_start}:00-{odd_end}:00) - and this IP had never been observed for this "
-                f"account before in the analyzed data.",
-                "medium", ["T1078.001", "T1078"], "Exploitation", [ev],
-                {"users": [s["username"]], "ips": [s["src_ip"]],
-                 "hosts": [s["host"] or "?"], "processes": []}))
+        for r in rows:
+            key = (r["username"], r["src_ip"])
+            if key != group_key:
+                group_key = key
+                fail_buf = []
+                first_ts = None
+            if first_ts is None:
+                first_ts = r["ts"]
+            if r["event_type"] == "auth_failure":
+                fail_buf.append(dict(r))
+                # keep only the trailing window
+                cutoff = r["ts"] - window_s
+                while fail_buf and fail_buf[0]["ts"] < cutoff:
+                    fail_buf.pop(0)
+            else:
+                host = r["host"]
+                recent = [f for f in fail_buf if f["ts"] >= r["ts"] - window_s]
+                if len(recent) >= min_failures:
+                    out.append(make_success_det(r, recent, host))
+                if (det_mod.is_external(r["src_ip"])
+                        and abs(first_ts - r["ts"]) < 1):
+                    hour = det_mod.datetime.fromtimestamp(r["ts"]).hour
+                    if hour >= odd_start or hour < odd_end:
+                        out.append(make_odd_det(r, host))
+                # Any successful admin-interface login from an external IP is
+                # inherently suspicious on a perimeter device, regardless of
+                # whether failures preceded it.
+                if (det_mod.is_external(r["src_ip"]) and r["host"]
+                        and ("logged in successfully" in (r["message"] or "").lower()
+                             or "login successful" in (r["message"] or "").lower())):
+                    ev = {"id": r["id"], "ts": r["ts"], "username": r["username"],
+                          "host": host, "src_ip": r["src_ip"], "message": r["message"]}
+                    out.append(_mk(
+                        "ADMIN_LOGIN_EXTERNAL",
+                        "Successful admin login from an external IP", "high",
+                        f"Account '{r['username']}' successfully logged into the admin "
+                        f"interface of perimeter device {host} from external IP "
+                        f"{r['src_ip']} at {det_mod.fmt_time(r['ts'])}. Successful "
+                        f"external administration is observed evidence; whether this "
+                        f"specific login is the attacker or a legitimate administrator "
+                        f"requires verification with the account owner.",
+                        "high", ["T1078"], "Exploitation", [ev],
+                        {"users": [r["username"]], "ips": [r["src_ip"]],
+                         "hosts": [host], "processes": []}))
     return out
 
 
@@ -220,44 +246,56 @@ def detect_privilege_large(conn: sqlite3.Connection, max_groups=100) -> list[dic
 
 
 def detect_port_scan(conn: sqlite3.Connection, min_ports=20, max_groups=100) -> list[dict]:
-    """External sources touching many distinct ports on one internal target."""
+    """External sources touching many distinct ports on one internal target.
+
+    Two-phase for scale: (1) streaming GROUP BY (index-ordered, no temp b-tree)
+    finds candidate pairs with many sessions; (2) per-candidate distinct-port
+    counts (few candidates, each an index range scan).
+    """
     out = []
     try:
-        rows = conn.execute(
-            """SELECT src_ip, dst_ip, COUNT(DISTINCT dst_port) ports, COUNT(*) c,
-               MIN(ts) t0, MAX(ts) t1
+        candidates = conn.execute(
+            """SELECT src_ip, dst_ip, COUNT(*) c
                FROM events INDEXED BY idx_net_pair
                WHERE event_type='network' AND dst_port IS NOT NULL
-               GROUP BY src_ip, dst_ip HAVING ports >= ? ORDER BY ports DESC LIMIT ?""",
-            (min_ports, max_groups)).fetchall()
+               GROUP BY src_ip, dst_ip HAVING c >= 40 LIMIT 500""").fetchall()
     except sqlite3.OperationalError:
-        # index not present (small databases) - fall back to the plain query
-        rows = conn.execute(
-            """SELECT src_ip, dst_ip, COUNT(DISTINCT dst_port) ports, COUNT(*) c,
-               MIN(ts) t0, MAX(ts) t1
+        candidates = conn.execute(
+            """SELECT src_ip, dst_ip, COUNT(*) c
                FROM events WHERE event_type='network' AND dst_port IS NOT NULL
-               GROUP BY src_ip, dst_ip HAVING ports >= ? ORDER BY ports DESC LIMIT ?""",
-            (min_ports, max_groups)).fetchall()
-    for r in rows:
+               GROUP BY src_ip, dst_ip HAVING c >= 40 LIMIT 500""").fetchall()
+    for r in candidates:
         ext_src = det_mod.is_external(r["src_ip"])
         ext_dst = det_mod.is_external(r["dst_ip"])
         if ext_src == ext_dst:
             continue  # only interested in cross-boundary scanning
+        meta = conn.execute(
+            """SELECT COUNT(DISTINCT dst_port) p, COUNT(*) c, MIN(ts) t0, MAX(ts) t1
+               FROM events INDEXED BY idx_net_pair
+               WHERE event_type='network' AND src_ip=? AND dst_ip=? AND dst_port IS NOT NULL""",
+            (r["src_ip"], r["dst_ip"])).fetchone()
+        ports = meta["p"]
+        if ports < min_ports:
+            continue
         sample = [dict(x) for x in conn.execute(
             """SELECT id, ts, username, host, src_ip, dst_ip, message FROM events
-               WHERE event_type='network' AND src_ip=? AND dst_ip=? ORDER BY ts LIMIT 40""",
+               INDEXED BY idx_net_pair
+               WHERE event_type='network' AND src_ip=? AND dst_ip=? LIMIT 40""",
             (r["src_ip"], r["dst_ip"]))]
         direction = ("External scan of an internal host" if ext_src else
                      "Internal host scanning an external system")
         out.append(_mk(
             "PORT_SCAN", "Port scanning / service discovery", "medium",
-            f"{direction}: {r['src_ip']} touched {r['ports']} distinct ports on {r['dst_ip']} "
-            f"across {r['c']} events ({det_mod.fmt_time(r['t0'])} - {det_mod.fmt_time(r['t1'])}). "
+            f"{direction}: {r['src_ip']} touched {ports} distinct ports on {r['dst_ip']} "
+            f"across {meta['c']} events ({det_mod.fmt_time(meta['t0'])} - "
+            f"{det_mod.fmt_time(meta['t1'])}). "
             f"Scanning indicates reconnaissance; it does not by itself imply successful access.",
             "medium", ["T1046"], "Reconnaissance", sample,
             {"users": sorted({s["username"] or "?" for s in sample})[:10],
              "ips": [r["src_ip"], r["dst_ip"]],
              "hosts": sorted({s["host"] or "?" for s in sample}), "processes": []}))
+        if len(out) >= max_groups:
+            break
     return out
 
 
@@ -369,8 +407,7 @@ def run_streaming_detectors(conn: sqlite3.Connection) -> list[dict]:
     detections.extend(detect_credential_spraying(conn))
     detections.extend(detect_targeted_bruteforce(conn))
     detections.extend(detect_pair_bursts(conn))
-    detections.extend(detect_success_after_failures_large(conn))
-    detections.extend(detect_odd_hour_large(conn))
+    detections.extend(detect_auth_transitions_large(conn))
     detections.extend(detect_privilege_large(conn))
     detections.extend(detect_port_scan(conn))
     detections.extend(detect_large_transfers(conn))
@@ -387,4 +424,4 @@ def run_streaming_detectors(conn: sqlite3.Connection) -> list[dict]:
 
 
 CREDENTIAL_FAMILY = {"BRUTE_FORCE_AUTH", "SUCCESS_AFTER_FAILURES", "AUTH_SPRAYING",
-                     "AUTH_TARGETED_BRUTE"}
+                     "AUTH_TARGETED_BRUTE", "ADMIN_LOGIN_EXTERNAL"}

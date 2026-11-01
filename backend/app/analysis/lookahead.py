@@ -131,6 +131,10 @@ def build_lookahead(events: list[dict], detections: list[dict]) -> dict:
     for (src_host, dst_key, port), svc in remote_services.items():
         if dst_key in accessed_hosts:
             continue
+        # routine outbound internet traffic is not a lateral-movement candidate:
+        # only internal-to-internal reachability is relevant for look-ahead
+        if det_mod.is_external(svc.get("dst_ip")):
+            continue
         is_ip = dst_key.replace(".", "").isdigit()
         targets.append({
             "target": _ent_ip(dst_key) if is_ip else _ent_host(dst_key),

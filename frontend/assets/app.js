@@ -595,9 +595,9 @@ async function viewInvestigation(root, id) {
     </div>
 
     <div class="panel"><div class="panel-h"><div class="bar"></div><h3>Full event timeline</h3>
-      <div class="right"><span class="faint small">click any event for raw evidence</span></div></div>
+      <div class="right"><span class="faint small">click any event for raw evidence${D.events.length > 400 ? ` · showing first 400 of ${D.events.length.toLocaleString()}` : ""}</span></div></div>
       <div class="panel-b" style="max-height:480px;overflow:auto"><div class="timeline" id="full-timeline">
-        ${D.events.map(e => {
+        ${D.events.slice(0, 400).map(e => {
           const detsE = dets.filter(d => d.event_ids.includes(e.id));
           const sev = detsE.length ? detsE.map(d => d.severity).sort((a, b) => SEV_ORDER[a] - SEV_ORDER[b])[0] : e.severity;
           return `<div class="tl-item sev-${sev}" data-ev="${e.id}"><div class="tl-card" onclick="showEvidence(${e.id})">

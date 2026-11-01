@@ -1,0 +1,280 @@
+{
+  "analysis": {
+    "analysis_id": 9,
+    "events_analyzed": 9125383,
+    "detections": 469,
+    "incidents": 6,
+    "status": "done",
+    "mode": "streaming"
+  },
+  "analysis_wall_min": 4.2494397838910425,
+  "peak_rss_gb": 0.0,
+  "incidents": [
+    {
+      "id": 723,
+      "ref": "INC-2026-0001",
+      "name": "FGT60FTK00000000 - distributed credential attack from a single source",
+      "summary": "Correlated campaign spanning 14658 evidence events on FGT60FTK00000000 involving account(s) 002, 003, 01_amanah, 01_huwaiza. Detected behavior: Distributed credential attack from a single source; Repeated failed logins (brute force); Sustained brute force against a specific account. Aggregate evidence covers 2,541,635 matching events. Reconstructed entry point: First externally-sourced authentication activity against FGT60FTK00000000 for account 'admin' from 209.50.167.232. (first seen 2026-10-23 14:18:26). External infrastructure involved: 1.213.180.29, 103.204.167.14, 104.207.33.118, 104.207.42.233, 104.207.45.25.",
+      "risk_score": 100,
+      "severity": "high",
+      "status": "open",
+      "first_ts": 1792745306.564464,
+      "last_ts": 1793350105.999999,
+      "is_demo": true,
+      "entities": {
+        "users": [
+          "002",
+          "003",
+          "01_amanah",
+          "01_huwaiza",
+          "09",
+          "103",
+          "107",
+          "11",
+          "1101227",
+          "2002",
+          "2003513",
+          "214",
+          "298",
+          "3dprint",
+          "4404",
+          "5giotlead",
+          "700",
+          "80",
+          "ABE0007",
+          "Admin03",
+          "T5",
+          "a.cantor",
+          "aaeon",
+          "aamir",
+          "aaron",
+          "abaco",
+          "abbas",
+          "abcd1234",
+          "abecolonr",
+          "abi83",
+          "abudhabi",
+          "abureesh",
+          "acacias",
+          "acc",
+          "acc01",
+          "acc4",
+          "accounts",
+          "ada",
+          "adam",
+          "adel"
+        ],
+        "hosts": [
+          "FGT60FTK00000000"
+        ],
+        "ips": [
+          "1.213.180.29",
+          "10.10.99.1",
+          "103.204.167.14",
+          "104.207.33.118",
+          "104.207.42.233",
+          "104.207.45.25",
+          "104.207.48.177",
+          "104.207.54.166",
+          "104.207.60.87",
+          "104.207.63.107",
+          "104.207.63.218",
+          "106.245.242.218",
+          "112.220.228.194",
+          "115.90.47.6",
+          "118.130.231.254",
+          "121.125.61.126",
+          "138.226.239.90",
+          "138.226.239.91",
+          "14.195.200.226",
+          "151.123.177.60",
+          "173.243.132.130",
+          "173.243.132.208",
+          "185.136.15.110",
+          "185.136.15.111",
+          "185.136.15.66",
+          "185.136.15.80",
+          "185.136.15.81",
+          "185.136.15.82",
+          "193.46.255.86",
+          "193.8.186.35",
+          "203.205.31.178",
+          "208.67.220.220",
+          "208.67.222.222",
+          "209.50.164.110",
+          "209.50.165.143",
+          "209.50.167.232",
+          "209.50.176.220",
+          "209.50.181.24",
+          "209.50.189.251",
+          "210.206.2.73"
+        ],
+        "processes": []
+      }
+    },
+    {
+      "id": 724,
+      "ref": "INC-2026-0002",
+      "name": "FGT60FTK00000000 - distributed credential attack from a single source",
+      "summary": "Correlated campaign spanning 47 evidence events on FGT60FTK00000000 involving account(s) Deepika.Khan, admin, airprintxerox, chethan. Detected behavior: Distributed credential attack from a single source; Repeated failed logins (brute force); Successful admin login from an external IP. Aggregate evidence covers 3,867 matching events. Reconstructed entry point: First externally-sourced authentication activity against FGT60FTK00000000 for account 'admin' from 15.199.16.197. (first seen 2026-10-27 18:28:36). External infrastructure involved: 15.199.16.197, 171.104.84.193, 203.228.177.117.",
+      "risk_score": 100,
+      "severity": "high",
+      "status": "open",
+      "first_ts": 1793105916.501676,
+      "last_ts": 1793246521.972862,
+      "is_demo": true,
+      "entities": {
+        "users": [
+          "Deepika.Khan",
+          "admin",
+          "airprintxerox",
+          "chethan",
+          "navid",
+          "svc_backup30"
+        ],
+        "hosts": [
+          "FGT60FTK00000000"
+        ],
+        "ips": [
+          "10.10.99.1",
+          "15.199.16.197",
+          "171.104.84.193",
+          "203.228.177.117"
+        ],
+        "processes": []
+      }
+    },
+    {
+      "id": 725,
+      "ref": "INC-2026-0003",
+      "name": "FGT60FTK00000000 - login outside business hours from a first-seen source",
+      "summary": "Correlated campaign spanning 1 evidence events on FGT60FTK00000000 involving account(s) parul.sinha. Detected behavior: Login outside business hours from a first-seen source; Successful admin login from an external IP. Reconstructed entry point: First externally-sourced authentication activity against FGT60FTK00000000 for account 'parul.sinha' from 8.42.69.77. (first seen 2026-10-25 01:29:30). External infrastructure involved: 8.42.69.77.",
+      "risk_score": 38,
+      "severity": "high",
+      "status": "open",
+      "first_ts": 1792871970.559031,
+      "last_ts": 1792871970.559031,
+      "is_demo": true,
+      "entities": {
+        "users": [
+          "parul.sinha"
+        ],
+        "hosts": [
+          "FGT60FTK00000000"
+        ],
+        "ips": [
+          "10.10.99.1",
+          "8.42.69.77"
+        ],
+        "processes": []
+      }
+    },
+    {
+      "id": 726,
+      "ref": "INC-2026-0004",
+      "name": "FGT60FTK00000000 - intrusion-prevention alerts (traffic dropped)",
+      "summary": "Correlated campaign spanning 90 evidence events on FGT60FTK00000000 involving account(s) multiple. Detected behavior: Intrusion-prevention alerts (traffic dropped); Malware downloads blocked by security gateway; Web threats blocked by security gateway. Aggregate evidence covers 395,081 matching events. External infrastructure involved: 101.34.43.206, 101.83.32.29, 102.142.21.1, 103.47.79.173, 103.55.52.214.",
+      "risk_score": 28,
+      "severity": "medium",
+      "status": "open",
+      "first_ts": 1792745307.128928,
+      "last_ts": 1792747121.250963,
+      "is_demo": true,
+      "entities": {
+        "users": [],
+        "hosts": [
+          "FGT60FTK00000000"
+        ],
+        "ips": [
+          "10.10.10.105",
+          "10.10.10.107",
+          "10.10.10.108",
+          "10.10.10.120",
+          "10.10.10.123",
+          "10.10.10.125",
+          "10.10.10.150",
+          "10.10.10.153",
+          "10.10.10.155",
+          "10.10.10.156",
+          "10.10.10.164",
+          "10.10.10.186",
+          "10.10.10.19",
+          "10.10.10.203",
+          "10.10.10.207",
+          "10.10.10.217",
+          "10.10.10.218",
+          "10.10.10.60",
+          "10.10.10.71",
+          "10.10.10.99",
+          "10.10.20.116",
+          "10.10.20.117",
+          "10.10.20.127",
+          "10.10.20.203",
+          "10.10.20.226",
+          "10.10.20.240",
+          "10.10.20.30",
+          "10.10.20.38",
+          "10.10.20.51",
+          "10.10.20.52",
+          "10.10.20.53",
+          "10.10.20.87",
+          "10.10.30.123",
+          "10.10.30.138",
+          "10.10.30.159",
+          "10.10.30.166",
+          "10.10.30.204",
+          "10.10.30.225",
+          "10.10.30.238",
+          "10.10.30.30"
+        ],
+        "processes": []
+      }
+    },
+    {
+      "id": 727,
+      "ref": "INC-2026-0005",
+      "name": "FGT60FTK00000000 - port scanning / service discovery",
+      "summary": "Correlated campaign spanning 40 evidence events on FGT60FTK00000000 involving account(s) multiple. Detected behavior: Port scanning / service discovery. External infrastructure involved: 194.102.163.167.",
+      "risk_score": 18,
+      "severity": "medium",
+      "status": "open",
+      "first_ts": 1793135270.826456,
+      "last_ts": 1793135274.9501598,
+      "is_demo": true,
+      "entities": {
+        "users": [],
+        "hosts": [
+          "FGT60FTK00000000"
+        ],
+        "ips": [
+          "10.10.20.20",
+          "194.102.163.167"
+        ],
+        "processes": []
+      }
+    },
+    {
+      "id": 728,
+      "ref": "INC-2026-0006",
+      "name": "FGT60FTK00000000 - port scanning / service discovery",
+      "summary": "Correlated campaign spanning 40 evidence events on FGT60FTK00000000 involving account(s) multiple. Detected behavior: Port scanning / service discovery. External infrastructure involved: 32.127.48.11.",
+      "risk_score": 18,
+      "severity": "medium",
+      "status": "open",
+      "first_ts": 1793238683.449932,
+      "last_ts": 1793238693.760206,
+      "is_demo": true,
+      "entities": {
+        "users": [],
+        "hosts": [
+          "FGT60FTK00000000"
+        ],
+        "ips": [
+          "10.10.20.20",
+          "32.127.48.11"
+        ],
+        "processes": []
+      }
+    }
+  ]
+}

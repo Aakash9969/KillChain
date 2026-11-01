@@ -165,17 +165,21 @@ def build_storyboard(inc: dict, events: list[dict], detections: list[dict]) -> d
         if stage not in phases:
             continue
         ph = phases[stage]
-        items = sorted(ph["items"], key=lambda i: (i["ts"], i["event_ids"]))
-        # cap enormous phases (firewall datasets can produce 100k failed logins)
-        if len(items) > 400:
-            head = items[:120]
-            tail = items[-40:]
-            dropped = len(items) - len(head) - len(tail)
-            items = head + [{
+        all_items = sorted(ph["items"], key=lambda i: (i["ts"], i["event_ids"]))
+        flagged = [i for i in all_items if i["detection"]]
+        support = [i for i in all_items if not i["detection"]]
+        # at campaign scale, unflagged supporting events would drown the story:
+        # always show detection-backed steps; cap supporting context hard
+        if len(flagged) > 300:
+            head = flagged[:150]
+            tail = flagged[-50:]
+            dropped = len(flagged) - len(head) - len(tail)
+            shown_flagged = head + [{
                 "ts": (head[-1]["ts"] + tail[0]["ts"]) / 2,
                 "event_ids": [],
-                "action": f"... {dropped:,} further events of the same behavior in this phase "
-                          f"(aggregate view - full evidence remains queryable in the Log Explorer).",
+                "action": f"... {dropped:,} further detected events of the same behavior in "
+                          f"this phase (aggregate view - full evidence remains queryable in "
+                          f"the Log Explorer).",
                 "source": {"kind": "info", "id": "agg", "label": "aggregate"},
                 "target": {"kind": "info", "id": "agg", "label": "aggregate"},
                 "user": None, "host": None, "src_ip": None, "dst_ip": None,
@@ -183,14 +187,20 @@ def build_storyboard(inc: dict, events: list[dict], detections: list[dict]) -> d
                 "detection": None, "confidence": None, "observed": True,
                 "aggregate": True,
             }] + tail
+        else:
+            shown_flagged = flagged
+        shown_support = [] if flagged else support[:40]
+        items = sorted(shown_flagged + shown_support,
+                       key=lambda i: (i["ts"], i["event_ids"]))
         out_phases.append({
             "stage": stage,
             "title": stage,
             "description": STAGE_DESC.get(stage, ""),
             "detected": ph["detected"],
-            "first_ts": items[0]["ts"],
-            "last_ts": items[-1]["ts"],
-            "item_count": len(ph["items"]),
+            "first_ts": all_items[0]["ts"],
+            "last_ts": all_items[-1]["ts"],
+            "item_count": len(all_items),
+            "flagged_count": len(flagged),
             "items": items,
         })
 

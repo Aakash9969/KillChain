@@ -12,6 +12,8 @@ import sqlite3
 from .. import config, db
 from . import correlate, detectors, fw_detectors, mitre
 
+det_mod = detectors  # alias used by the streaming incident builder
+
 
 def run_analysis(is_demo: bool = True) -> dict:
     conn = db.get_db()
@@ -30,9 +32,11 @@ def run_analysis(is_demo: bool = True) -> dict:
             conn.commit()
         if mode == "full":
             events, detections = _analyze_full(conn)
+            incidents = correlate.build_incidents(events, detections, analysis_id, is_demo)
         else:
-            events, detections = _analyze_streaming(conn)
-        incidents = correlate.build_incidents(events, detections, analysis_id, is_demo)
+            events, detections, incident_seeds = _analyze_streaming(conn)
+            incidents = _incidents_from_clusters(incident_seeds, events, detections,
+                                                 analysis_id, is_demo)
 
         for d in detections:
             conn.execute(
@@ -117,39 +121,43 @@ def _analyze_streaming(conn: sqlite3.Connection):
         uniq.append(d)
     detections = uniq
 
-    events = _events_for_detections(conn, detections)
-    return events, detections
+    clusters = _campaign_clusters(detections)
+    events, cluster_event_ids = _events_for_detections(conn, detections, clusters)
+    seeds = []
+    for cluster, ceids in zip(clusters, cluster_event_ids):
+        eids: set[int] = set()
+        for d in cluster:
+            eids.update(d["event_ids"][:600])
+        eids.update(ceids)
+        seeds.append({"detections": cluster, "event_ids": eids})
+    return events, detections, seeds
 
 
 def _events_for_detections(conn: sqlite3.Connection, detections: list[dict],
-                           enrich_cap=2000) -> list[dict]:
-    """Materialize the (small) set of detection-backed events plus bounded
-    supporting context - never the full dataset."""
-    ids: set[int] = set()
-    for d in detections:
-        ids.update(d["event_ids"][:600])
-    # campaign clusters define incidents; enrich each cluster afterwards
-    clusters = _campaign_clusters(detections)
-    enriched: set[int] = set(ids)
+                           clusters: list[list[dict]], enrich_cap=2000):
+    """Materialize detection-backed events plus bounded supporting context per
+    cluster - never the full dataset. Returns (all_events, per_cluster_ids)."""
+    enriched: set[int] = set()
+    cluster_event_ids: list[set[int]] = []
     for cluster in clusters:
-        cluster_ids = set()
+        cluster_ids: set[int] = set()
         users: set[str] = set()
         hosts: set[str] = set()
-        ips: set[str] = set()
         tss: list[float] = []
         for d in cluster:
             cluster_ids.update(d["event_ids"][:600])
-            users.update((d["entities"] or {}).get("users") or [])
-            hosts.update((d["entities"] or {}).get("hosts") or [])
-            ips.update((d["entities"] or {}).get("ips") or [])
+            ents = d.get("entities") or {}
+            users.update(ents.get("users") or [])
+            hosts.update(ents.get("hosts") or [])
             if d.get("first_ts"):
                 tss.append(d["first_ts"])
             if d.get("last_ts"):
                 tss.append(d["last_ts"])
+            enriched.update(cluster_ids)
+        cluster_event_ids.append(cluster_ids)
         if not tss:
             continue
         span0, span1 = min(tss) - 1800, max(tss) + 1800
-        # bounded supporting context: same account or same host inside the span
         q_parts, q_args = [], []
         for u in list(users)[:12]:
             q_parts.append("username=?")
@@ -159,17 +167,15 @@ def _events_for_detections(conn: sqlite3.Connection, detections: list[dict],
             q_args.append(h)
         if not q_parts:
             continue
-        placeholders = ",".join("?" * len(cluster_ids)) or "NULL"
-        base_args = list(q_args) + [span0, span1] + list(cluster_ids)
+        ph = ",".join("?" * len(cluster_ids)) or "NULL"
         rows = conn.execute(
-            f"""SELECT * FROM events WHERE ts IS NOT NULL AND ({' OR '.join(q_parts)})
+            f"""SELECT id FROM events WHERE ts IS NOT NULL AND ({' OR '.join(q_parts)})
                 AND ts BETWEEN ? AND ?
-                AND id NOT IN ({placeholders})
-                ORDER BY ts LIMIT ?""",
-            (*base_args, enrich_cap))
+                AND id NOT IN ({ph})
+                LIMIT ?""",
+            (*q_args, span0, span1, *cluster_ids, enrich_cap))
         for r in rows:
             enriched.add(r["id"])
-    # fetch final event set in chunks (bounded by detections + enrichment)
     out: list[dict] = []
     id_list = sorted(enriched)
     for i in range(0, len(id_list), 900):
@@ -180,7 +186,75 @@ def _events_for_detections(conn: sqlite3.Connection, detections: list[dict],
             e["details"] = db.jload(e.get("details"), {})
             out.append(e)
     out.sort(key=lambda e: (e.get("ts") or 0, e["id"]))
-    return out
+    return out, cluster_event_ids
+
+
+def _incidents_from_clusters(seeds: list[dict], events: list[dict],
+                             detections: list[dict], analysis_id: int,
+                             is_demo: bool) -> list[dict]:
+    """Assemble incidents from campaign clusters (streaming path).
+
+    All detections in a cluster form ONE incident; its timeline is the cluster's
+    detection evidence plus the bounded supporting events loaded for it.
+    """
+    events_by_id = {e["id"]: e for e in events}
+    incidents = []
+    for seed in seeds:
+        dets = seed["detections"]
+        eids = set(seed["event_ids"])
+        cluster_events = sorted((events_by_id[eid] for eid in eids if eid in events_by_id),
+                                key=lambda e: (e.get("ts") or 0, e["id"]))
+        if not cluster_events:
+            continue
+        tss = [e.get("ts") for e in cluster_events if e.get("ts") is not None]
+        risk = correlate._risk_score(dets, cluster_events)
+        sev = max((d["severity"] for d in dets),
+                  key=lambda s: det_mod.SEV_RANK.get(s, 0))
+        entry = correlate._find_entry_point(cluster_events)
+        hosts_all = sorted({e.get("host") for e in cluster_events if e.get("host")})
+        users_all = sorted({e.get("username") for e in cluster_events if e.get("username")})
+        ips_all = sorted({ip for e in cluster_events
+                          for ip in (e.get("src_ip"), e.get("dst_ip")) if ip})
+        top_titles = sorted({d["title"] for d in dets})[:3]
+        agg_total = sum(d.get("total_events", 0) for d in dets)
+        name = f"{hosts_all[0] if hosts_all else 'Unknown host'} - " \
+               f"{top_titles[0].lower() if top_titles else 'suspicious activity'}"
+        summary = (f"Correlated campaign spanning {len(cluster_events)} evidence events on "
+                   f"{', '.join(hosts_all[:2]) or 'unknown host'} involving account(s) "
+                   f"{', '.join(users_all[:4]) or 'multiple'}. Detected behavior: "
+                   f"{'; '.join(top_titles)}.")
+        if agg_total:
+            summary += f" Aggregate evidence covers {agg_total:,} matching events."
+        if entry:
+            summary += (f" Reconstructed entry point: {entry['description']} "
+                        f"(first seen {det_mod.fmt_time(entry['first_seen_ts'])}).")
+        ext = sorted({ip for ip in ips_all if det_mod.is_external(ip)})
+        if ext:
+            summary += f" External infrastructure involved: {', '.join(ext[:5])}."
+        incidents.append({
+            "analysis_id": analysis_id,
+            "ref": "",
+            "name": name,
+            "summary": summary,
+            "risk_score": risk,
+            "severity": sev,
+            "first_ts": min(tss) if tss else None,
+            "last_ts": max(tss) if tss else None,
+            "event_ids": [e["id"] for e in cluster_events][:4000],
+            "detection_ids": [d["rule_id"] + ":" + str(d["event_ids"][0]) for d in dets],
+            "entities": {"users": users_all[:40], "hosts": hosts_all[:10],
+                         "ips": ips_all[:40],
+                         "processes": sorted({e.get("process") for e in cluster_events
+                                              if e.get("process")})},
+            "entry_point": entry,
+            "hypotheses": [],
+            "is_demo": is_demo,
+            "_detections": dets,
+        })
+    incidents.sort(key=lambda i: -i["risk_score"])
+    for n, inc in enumerate(incidents, 1):
+        inc["ref"] = f"INC-2026-{n:04d}"
+    return incidents
 
 
 def _campaign_clusters(detections: list[dict]) -> list[list[dict]]:

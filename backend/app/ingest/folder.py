@@ -156,15 +156,22 @@ def resume_job(job_id: str) -> dict:
 
 
 def mark_interrupted_jobs() -> None:
-    """On startup, any folder job still marked 'running' died with the process."""
+    """On startup, any folder job still marked 'running' died with the process.
+    Tolerates a briefly-locked database (another instance shutting down)."""
     conn = db.get_db()
-    conn.execute("UPDATE ingest_jobs SET status='interrupted', error_text="
-                 "'Process exited during ingestion - resume available' "
-                 "WHERE status='running' AND origin='folder'")
-    # analyses left 'running' by a previous process also died
-    conn.execute("UPDATE analyses SET status='error', finished_at=?, note="
-                 "'Process exited during analysis' WHERE status='running'", (db.now(),))
-    conn.commit()
+    for attempt in range(10):
+        try:
+            conn.execute("UPDATE ingest_jobs SET status='interrupted', error_text="
+                         "'Process exited during ingestion - resume available' "
+                         "WHERE status='running' AND origin='folder'")
+            # analyses left 'running' by a previous process also died
+            conn.execute("UPDATE analyses SET status='error', finished_at=?, note="
+                         "'Process exited during analysis' WHERE status='running'", (db.now(),))
+            conn.commit()
+            return
+        except sqlite3.OperationalError:
+            time.sleep(0.5 * (attempt + 1))
+    # non-fatal: the app still starts; stale rows simply keep their status
 
 
 # ---------------------------------------------------------------------------
