@@ -225,6 +225,19 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute(ddl)
 
 
+def checkpoint_wal() -> None:
+    """Fold the WAL back into the main database and truncate it.
+
+    Called after heavy write phases (ingestion, analysis) so the WAL cannot
+    grow to tens of GB while long-running readers pin old snapshots.
+    """
+    try:
+        conn = get_db()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.OperationalError:
+        pass  # another connection holds a snapshot; the size limit covers it
+
+
 def bump_severity_counts(batch: list[dict]) -> None:
     """Incrementally maintain severity counters (avoids full-table GROUP BY
     on multi-million-row event tables when rendering the dashboard)."""

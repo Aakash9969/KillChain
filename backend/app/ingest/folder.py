@@ -191,7 +191,9 @@ def _run_folder_job(job_id: str) -> None:
             _process_file(job_id, frow, session_start)
         _finalize_job(job_id, directory, session_start)
     except Exception as exc:  # noqa: BLE001 - job must never die silently
-        JOBS.update(job_id, status="error", error_text=str(exc), finished_at=db.now())
+        JOBS.update(job_id, status="error", error_text=str(exc)[:500], finished_at=db.now())
+    finally:
+        db.checkpoint_wal()
 
 
 def _finalize_job(job_id: str, directory: str, session_start: float) -> None:

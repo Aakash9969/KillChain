@@ -68,6 +68,7 @@ def run_analysis(is_demo: bool = True) -> dict:
                detections=?, incidents=?, note=? WHERE id=?""",
             (db.now(), n, len(detections), len(incidents), f"mode={mode}", analysis_id))
         conn.commit()
+        db.checkpoint_wal()
         return {
             "analysis_id": analysis_id, "events_analyzed": n,
             "detections": len(detections), "incidents": len(incidents), "status": "done",

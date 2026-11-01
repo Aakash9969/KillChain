@@ -182,10 +182,20 @@ def folder_start(body: FolderStartBody):
         p = Path(fp)
         if not p.is_file():
             raise HTTPException(400, f"File not found: {p.name}")
+    total_bytes = sum(Path(f).stat().st_size for f in body.files)
+    # disk-space pre-flight: normalized events + indexes take roughly 2.5x the
+    # raw input in the metadata store; refuse early with a clear message
+    free = shutil.disk_usage(config.DATA_DIR).free
+    if free < total_bytes * 2.5:
+        raise HTTPException(
+            400,
+            f"Not enough disk space: {total_bytes / 1e9:.1f} GB selected needs roughly "
+            f"{total_bytes * 2.5 / 1e9:.1f} GB of storage, but only {free / 1e9:.1f} GB is "
+            f"free on {config.DATA_DIR.anchor}. Free space or point KILLCHAIN_DATA_DIR at "
+            f"a drive with room.")
     job_id = folder.create_folder_job(str(directory), body.files)
     folder.start_folder_job(job_id)
-    return {"job_id": job_id, "files": len(body.files),
-            "total_bytes": sum(Path(f).stat().st_size for f in body.files)}
+    return {"job_id": job_id, "files": len(body.files), "total_bytes": total_bytes}
 
 
 @router.post("/ingest/folder/resume")

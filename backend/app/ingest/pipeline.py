@@ -78,6 +78,13 @@ JOBS = JobRegistry()
 
 def _ingest_stream(job_id: str, source_id: int, path: Path, format_hint: str) -> None:
     """Stream a file line by line, batch-insert canonical events."""
+    try:
+        _ingest_stream_inner(job_id, source_id, path, format_hint)
+    except Exception as exc:  # never leave a job stuck in 'running'
+        JOBS.update(job_id, status="error", error_text=str(exc)[:500], finished_at=db.now())
+
+
+def _ingest_stream_inner(job_id: str, source_id: int, path: Path, format_hint: str) -> None:
     now = datetime.now()
     batch: list[dict] = []
     processed = parsed = errors = 0
@@ -135,6 +142,7 @@ def _ingest_stream(job_id: str, source_id: int, path: Path, format_hint: str) ->
         "UPDATE sources SET total_lines=?, parsed_events=?, parse_errors=? WHERE id=?",
         (processed, parsed, errors, source_id))
     conn.commit()
+    db.checkpoint_wal()
     JOBS.update(job_id, status="done", processed_lines=processed, parsed_events=parsed,
                 parse_errors=errors, finished_at=db.now(), source_id=source_id)
 
