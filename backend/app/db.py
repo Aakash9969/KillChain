@@ -26,6 +26,9 @@ def _connect() -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    # keep the WAL file bounded: auto-truncate after checkpoints (long-running
+    # analysis readers can otherwise pin the WAL at tens of GB on large datasets)
+    conn.execute("PRAGMA journal_size_limit=2147483648")  # 2 GB
     return conn
 
 
